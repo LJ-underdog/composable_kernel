@@ -3,11 +3,16 @@
 
 #pragma once
 
-#if defined(__gfx908__) || defined(__gfx90a__) || defined(__gfx942__) || defined(__gfx950__)
+#if defined(__gfx908__) || defined(__gfx90a__) || defined(__gfx942__) || defined(__gfx950__) || \
+    defined(__gfx9_4_generic__)
 #define __gfx9__
 #endif
-#if defined(__gfx942__) || defined(__gfx950__)
+#if defined(__gfx942__) || defined(__gfx950__) || defined(__gfx9_4_generic__)
 #define __gfx94__
+#endif
+#if defined(__gfx1010__) || defined(__gfx1011__) || defined(__gfx1012__) || \
+    defined(__gfx1013__) || defined(__gfx10_1_generic__)
+#define __gfx101__
 #endif
 #if defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__) || \
     defined(__gfx1034__) || defined(__gfx1035__) || defined(__gfx1036__) || \
@@ -210,7 +215,7 @@
 #elif defined(__gfx803__) || defined(__gfx900__) || defined(__gfx906__) || \
     defined(__gfx9__) // for GPU code
 #define CK_TILE_BUFFER_RESOURCE_3RD_DWORD 0x00020000
-#elif defined(__gfx103__) // for GPU code
+#elif defined(__gfx101__) || defined(__gfx103__) // for GPU code
 #define CK_TILE_BUFFER_RESOURCE_3RD_DWORD 0x31014000
 #elif defined(__gfx11__) || defined(__gfx12__) // for GPU code
 #define CK_TILE_BUFFER_RESOURCE_3RD_DWORD 0x31004000
@@ -263,7 +268,7 @@
 #endif
 
 #ifndef CK_TILE_USE_BUFFER_ADDRESSING_BUILTIN
-#if __clang_major__ >= 20
+#if __clang_major__ >= 20 && !(defined(__gfx103__) || defined(__gfx11__) || defined(__gfx12__))
 #define CK_TILE_USE_BUFFER_ADDRESSING_BUILTIN 1
 #else
 #define CK_TILE_USE_BUFFER_ADDRESSING_BUILTIN 0
