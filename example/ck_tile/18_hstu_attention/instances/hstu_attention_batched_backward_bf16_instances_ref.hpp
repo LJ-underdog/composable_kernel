@@ -6,7 +6,7 @@
 // See the generator script
 // `ck_hstu/example/ck_tile/18_hstu_attention/generate_instances.py`
 
-#include <ck_tile/core/numeric/half.hpp>
+#include <ck_tile/core/numeric/bfloat16.hpp>
 #include "hstu_attention_batched_backward_dispatch.hpp"
 
 extern template void run_batched_backward_dispatch<

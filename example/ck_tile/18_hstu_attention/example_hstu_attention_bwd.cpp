@@ -44,7 +44,7 @@
 #include "hstu_attention_bwd_params.hpp"
 #include "reference_hstu_attention_bwd.hpp"
 
-#include "hstu_attention_util.hpp"
+#include "hstu_attention_host_util.hpp"
 #include "hstu_attention_api.hpp"
 
 static std::vector<int> get_integers_from_string(std::string srcStr)
@@ -351,6 +351,9 @@ bool run_no_group_hstu_bwd(const ck_tile::ArgParser& arg_parser)
         fp.batch_stride_o     = o_host.get_strides()[0];
         fp.num_targets_ptr = num_targets.empty() ? nullptr : num_targets_dev.GetDeviceBuffer();
         fp.use_softmax        = use_softmax;
+        // M5 baseline (SiLU): no LSE storage. M5 softmax wiring sets these below.
+        fp.is_training        = false;
+        fp.lse_ptr            = nullptr;
         fp.use_causal         = use_causal;
         fp.window_size        = window_size;
         fp.contextual_seqlen  = contextual_seqlen;
