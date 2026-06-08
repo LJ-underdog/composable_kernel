@@ -4,7 +4,6 @@
 #pragma once
 
 #include <ck_tile/core.hpp>
-#include <ck_tile/ops/common.hpp>
 #include <ck_tile/ops/fmha/block/block_dropout.hpp>
 
 #include <string>
@@ -13,7 +12,7 @@
 #include <variant>
 
 #include "hstu_block_masking.hpp"
-#include "hstu_attention_util.hpp"
+#include "hstu_attention_kernel_util.hpp"
 
 #ifndef HSTU_SCHED_BATCH_AS_FIRST_GRID_DIM
 #define HSTU_SCHED_BATCH_AS_FIRST_GRID_DIM 1
@@ -36,9 +35,13 @@ struct HstuAttentionFwdKernel
     static constexpr ck_tile::index_t kBlockPerCu = HstuAttentionPipeline::kBlockPerCu;
     static_assert(kBlockPerCu > 0);
 
-    using QKVDataType  = ck_tile::remove_cvref_t<typename HstuAttentionPipeline::QKVDataType>;
-    using BiasDataType = ck_tile::remove_cvref_t<typename HstuAttentionPipeline::BiasDataType>;
-    using ODataType    = ck_tile::remove_cvref_t<typename HstuAttentionPipeline::ODataType>;
+    using QKVDataType =
+        ck_tile::remove_cvref_t<typename HstuAttentionPipeline::Problem::QKVDataType>;
+    using BiasDataType =
+        ck_tile::remove_cvref_t<typename HstuAttentionPipeline::Problem::BiasDataType>;
+    using ODataType = ck_tile::remove_cvref_t<typename HstuAttentionPipeline::Problem::ODataType>;
+    using CompDataType =
+        ck_tile::remove_cvref_t<typename HstuAttentionPipeline::Problem::CompDataType>;
 
     static constexpr bool kIsCrossAttention = HstuAttentionPipeline::Problem::kIsCrossAttention;
     static constexpr bool kUseGroup         = HstuAttentionPipeline::Problem::kUseGroup;
@@ -47,6 +50,7 @@ struct HstuAttentionFwdKernel
     static constexpr bool kHasDropout       = HstuAttentionPipeline::Problem::kHasDropout;
     static constexpr bool kHasCausalMask    = HstuAttentionPipeline::Problem::kHasCausal;
     static constexpr bool kUseSoftmax       = HstuAttentionPipeline::Problem::kUseSoftmax;
+    static constexpr bool kStoreLSE         = HstuAttentionPipeline::Problem::kStoreLSE;
 
     static constexpr bool kPadSeqLenQ   = HstuAttentionPipeline::kPadSeqLenQ;
     static constexpr bool kPadSeqLenK   = HstuAttentionPipeline::kPadSeqLenK;
@@ -184,22 +188,40 @@ struct HstuAttentionFwdKernel
         const float* group_attn_scale_ptr;
     };
 
-    struct HstuAttentionFwdCommonBiasKargs
+    struct HstuAttentionFwdBatchedBiasKargs
     {
-        const void* bias_ptr               = nullptr;
-        ck_tile::index_t seq_stride_bias   = 0;
-        ck_tile::index_t nhead_stride_bias = 0;
+        const void* bias_ptr;
+        ck_tile::index_t seq_stride_bias;
+        ck_tile::index_t nhead_stride_bias;
+        ck_tile::index_t batch_stride_bias;
     };
 
-    struct HstuAttentionFwdBatchModeBiasKargs : HstuAttentionFwdCommonBiasKargs
+    struct HstuAttentionFwdJaggedBiasKargs
     {
-        ck_tile::index_t batch_stride_bias = 0;
+        const void* bias_ptr;
+        ck_tile::index_t seq_stride_bias;
+        ck_tile::index_t nhead_stride_bias;
     };
 
     struct HstuAttentionFwdDropoutSeedOffset
     {
         uint64_t drop_seed;
         uint64_t drop_offset;
+    };
+
+    struct HstuAttentionFwdBatchedLSEKargs
+    {
+        void* lse_ptr;
+        ck_tile::index_t batch_stride_lse;
+        ck_tile::index_t seq_stride_lse;
+        ck_tile::index_t nhead_stride_lse;
+    };
+
+    struct HstuAttentionFwdJaggedLSEKargs
+    {
+        void* lse_ptr;
+        ck_tile::index_t seq_stride_lse;
+        ck_tile::index_t nhead_stride_lse;
     };
 
     struct HstuAttentionFwdCommonDropoutKargs : HstuAttentionFwdDropoutSeedOffset
@@ -222,32 +244,42 @@ struct HstuAttentionFwdKernel
     struct HstuAttentionNoGroupBatchedFwdKargs
         : HstuAttentionNoGroupBatchedFwdBaseKargs,
           std::conditional_t<kHasBias,
-                             HstuAttentionFwdBatchModeBiasKargs,
+                             HstuAttentionFwdBatchedBiasKargs,
                              HstuAttentionFwdEmptyKargs<1>>,
           std::conditional_t<kHasDropout,
                              HstuAttentionFwdCommonDropoutKargs,
-                             HstuAttentionFwdEmptyKargs<2>>
+                             HstuAttentionFwdEmptyKargs<2>>,
+          std::conditional_t<kStoreLSE,
+                             HstuAttentionFwdBatchedLSEKargs,
+                             HstuAttentionFwdEmptyKargs<3>>
+
     {
     };
 
     struct HstuAttentionNoGroupJaggedFwdKargs
         : HstuAttentionNoGroupJaggedFwdBaseKargs,
           std::conditional_t<kHasBias,
-                             HstuAttentionFwdCommonBiasKargs,
+                             HstuAttentionFwdJaggedBiasKargs,
                              HstuAttentionFwdEmptyKargs<1>>,
           std::conditional_t<kHasDropout,
                              HstuAttentionFwdCommonDropoutKargs,
-                             HstuAttentionFwdEmptyKargs<2>>
+                             HstuAttentionFwdEmptyKargs<2>>,
+          std::conditional_t<kStoreLSE,
+                             HstuAttentionFwdJaggedLSEKargs,
+                             HstuAttentionFwdEmptyKargs<3>>
     {
     };
 
     struct HstuAttentionGroupFwdKargs : HstuAttentionGroupFwdBaseKargs,
                                         std::conditional_t<kHasBias,
-                                                           HstuAttentionFwdCommonBiasKargs,
+                                                           HstuAttentionFwdJaggedBiasKargs,
                                                            HstuAttentionFwdEmptyKargs<1>>,
                                         std::conditional_t<kHasDropout,
                                                            HstuAttentionFwdCommonDropoutKargs,
-                                                           HstuAttentionFwdEmptyKargs<2>>
+                                                           HstuAttentionFwdEmptyKargs<2>>,
+                                        std::conditional_t<kStoreLSE,
+                                                           HstuAttentionFwdJaggedLSEKargs,
+                                                           HstuAttentionFwdEmptyKargs<3>>
     {
     };
 
@@ -267,6 +299,7 @@ struct HstuAttentionFwdKernel
               const void* v_ptr,
               const void* bias_ptr,
               void* o_ptr,
+              void* lse_ptr,
               ck_tile::index_t seqlen_q,
               ck_tile::index_t seqlen_kv,
               ck_tile::index_t hdim_qk,
@@ -279,16 +312,19 @@ struct HstuAttentionFwdKernel
               ck_tile::index_t seq_stride_v,
               ck_tile::index_t seq_stride_bias,
               ck_tile::index_t seq_stride_o,
+              ck_tile::index_t seq_stride_lse,
               ck_tile::index_t nhead_stride_q,
               ck_tile::index_t nhead_stride_k,
               ck_tile::index_t nhead_stride_v,
               ck_tile::index_t nhead_stride_bias,
               ck_tile::index_t nhead_stride_o,
+              ck_tile::index_t nhead_stride_lse,
               ck_tile::index_t batch_stride_q,
               ck_tile::index_t batch_stride_k,
               ck_tile::index_t batch_stride_v,
               ck_tile::index_t batch_stride_bias,
               ck_tile::index_t batch_stride_o,
+              ck_tile::index_t batch_stride_lse,
               const void* num_targets_ptr,
               ck_tile::index_t contextual_seqlen,
               ck_tile::index_t window_size,
@@ -327,6 +363,7 @@ struct HstuAttentionFwdKernel
              min_full_attn_seqlen}, // args for common karg
             {},                     // placeholder for bias
             {},                     // placeholder for dropout
+            {},                     // placeholder for LSE
         };
 
         if constexpr(kHasBias)
@@ -340,6 +377,13 @@ struct HstuAttentionFwdKernel
         {
             kargs.init_dropout(p_drop, philox_seed, philox_offset);
         }
+        if constexpr(kStoreLSE)
+        {
+            kargs.lse_ptr          = lse_ptr;
+            kargs.batch_stride_lse = batch_stride_lse;
+            kargs.seq_stride_lse   = seq_stride_lse;
+            kargs.nhead_stride_lse = nhead_stride_lse;
+        }
 
         return kargs;
     }
@@ -351,6 +395,7 @@ struct HstuAttentionFwdKernel
               const void* v_ptr,
               const void* bias_ptr,
               void* o_ptr,
+              void* lse_ptr,
               const void* seq_q_offsets_ptr,
               const void* seq_kv_offsets_ptr,
               ck_tile::index_t max_seqlen_q,
@@ -364,11 +409,13 @@ struct HstuAttentionFwdKernel
               ck_tile::index_t seq_stride_v,
               ck_tile::index_t seq_stride_bias,
               ck_tile::index_t seq_stride_o,
+              ck_tile::index_t seq_stride_lse,
               ck_tile::index_t nhead_stride_q,
               ck_tile::index_t nhead_stride_k,
               ck_tile::index_t nhead_stride_v,
               ck_tile::index_t nhead_stride_bias,
               ck_tile::index_t nhead_stride_o,
+              ck_tile::index_t nhead_stride_lse,
               const void* num_targets_ptr,
               ck_tile::index_t contextual_seqlen,
               ck_tile::index_t window_size,
@@ -405,6 +452,7 @@ struct HstuAttentionFwdKernel
              min_full_attn_seqlen}, // args for common karg
             {},                     // placeholder for bias
             {},                     // placeholder for dropout
+            {},                     // placeholder for LSE
         };
 
         if constexpr(kHasBias)
@@ -417,6 +465,12 @@ struct HstuAttentionFwdKernel
         {
             kargs.init_dropout(p_drop, philox_seed, philox_offset);
         }
+        if constexpr(kStoreLSE)
+        {
+            kargs.lse_ptr          = lse_ptr;
+            kargs.seq_stride_lse   = seq_stride_lse;
+            kargs.nhead_stride_lse = nhead_stride_lse;
+        }
 
         return kargs;
     }
@@ -428,6 +482,7 @@ struct HstuAttentionFwdKernel
               const void* v_ptr,
               const void* bias_ptr,
               void* o_ptr,
+              void* lse_ptr,
               ck_tile::index_t num_batch_per_group,
               const void* seq_q_offsets_ptr,
               const void* seq_kv_offsets_ptr,
@@ -445,11 +500,13 @@ struct HstuAttentionFwdKernel
               ck_tile::index_t seq_stride_v,
               ck_tile::index_t seq_stride_bias,
               ck_tile::index_t seq_stride_o,
+              ck_tile::index_t seq_stride_lse,
               ck_tile::index_t nhead_stride_q,
               ck_tile::index_t nhead_stride_k,
               ck_tile::index_t nhead_stride_v,
               ck_tile::index_t nhead_stride_bias,
               ck_tile::index_t nhead_stride_o,
+              ck_tile::index_t nhead_stride_lse,
               const void* num_targets_ptr,
               float p_drop,
               uint64_t philox_seed,
@@ -489,6 +546,7 @@ struct HstuAttentionFwdKernel
              reinterpret_cast<const float*>(group_attn_scale_ptr)}, // args for common karg
             {},                                                     // placeholder for bias
             {},                                                     // placeholder for dropout
+            {},                                                     // placeholder for LSE
         };
 
         if constexpr(kHasBias)
@@ -500,6 +558,12 @@ struct HstuAttentionFwdKernel
         if constexpr(kHasDropout)
         {
             kargs.init_dropout(p_drop, philox_seed, philox_offset);
+        }
+        if constexpr(kStoreLSE)
+        {
+            kargs.lse_ptr          = lse_ptr;
+            kargs.seq_stride_lse   = seq_stride_lse;
+            kargs.nhead_stride_lse = nhead_stride_lse;
         }
 
         return kargs;
@@ -638,6 +702,7 @@ struct HstuAttentionFwdKernel
         long_index_t batch_offset_v    = 0;
         long_index_t batch_offset_bias = 0;
         long_index_t batch_offset_o    = 0;
+        long_index_t batch_offset_lse  = 0;
 
         if constexpr(kIsJagged)
         {
@@ -654,6 +719,10 @@ struct HstuAttentionFwdKernel
                 batch_offset_bias = query_start * kargs.seq_stride_bias;
             }
             batch_offset_o = query_start * kargs.seq_stride_o;
+            if constexpr(kStoreLSE)
+            {
+                batch_offset_lse = query_start * kargs.seq_stride_lse;
+            }
 
             kargs.seqlen_q =
                 kargs.seq_q_offsets_ptr[i_batch + 1] - kargs.seq_q_offsets_ptr[i_batch];
@@ -684,6 +753,10 @@ struct HstuAttentionFwdKernel
                 batch_offset_bias = static_cast<long_index_t>(i_batch) * kargs.batch_stride_bias;
             }
             batch_offset_o = static_cast<long_index_t>(i_batch) * kargs.batch_stride_o;
+            if constexpr(kStoreLSE)
+            {
+                batch_offset_lse = static_cast<long_index_t>(i_batch) * kargs.batch_stride_lse;
+            }
         }
 
         int num_target = (kargs.num_targets_ptr == nullptr) ? 0 : kargs.num_targets_ptr[i_batch];
@@ -853,6 +926,35 @@ struct HstuAttentionFwdKernel
             }
         }();
 
+        auto lse_dram_window = [&, i_nhead_ = i_nhead]() {
+            constexpr auto lse_dram_window_lengths =
+                make_tuple(number<HstuAttentionPipeline::kM0>{});
+            if constexpr(kStoreLSE)
+            {
+                CompDataType* lse_ptr =
+                    reinterpret_cast<CompDataType*>(kargs.lse_ptr) +
+                    static_cast<long_index_t>(i_nhead_) * kargs.nhead_stride_lse + batch_offset_lse;
+
+                const auto lse_dram = [&]() {
+                    const auto lse_dram_naive = make_naive_tensor_view<address_space_enum::global>(
+                        lse_ptr,
+                        make_tuple(seqlen_q_in_ctrl),
+                        make_tuple(kargs.seq_stride_lse),
+                        number<1>{},
+                        number<1>{});
+
+                    return pad_tensor_view(
+                        lse_dram_naive, lse_dram_window_lengths, sequence<false>{});
+                }();
+
+                return make_tile_window(lse_dram, lse_dram_window_lengths, {i_m0});
+            }
+            else
+            {
+                return make_null_tile_window(lse_dram_window_lengths);
+            }
+        }();
+
         auto dropout = [&, i_nhead_ = i_nhead, i_batch_ = i_batch]() {
             if constexpr(kHasDropout)
             {
@@ -922,13 +1024,11 @@ struct HstuAttentionFwdKernel
                 }
                 else
                 {
-                    auto null_tile_window = ck_tile::make_null_tile_window(ck_tile::make_tuple());
-
                     return HstuAttentionPipeline{}(q_dram_window,
                                                    k_dram_window,
                                                    v_dram_window,
                                                    bias_dram_window,
-                                                   null_tile_window,
+                                                   lse_dram_window,
                                                    seqlen_k_start,
                                                    seqlen_k_end,
                                                    mask,
@@ -977,12 +1077,11 @@ struct HstuAttentionFwdKernel
                 }
                 else
                 {
-                    auto null_tile_window = ck_tile::make_null_tile_window(ck_tile::make_tuple());
                     return HstuAttentionPipeline{}(q_dram_window,
                                                    k_dram_window,
                                                    v_dram_window,
                                                    bias_dram_window,
-                                                   null_tile_window,
+                                                   lse_dram_window,
                                                    seqlen_k_start,
                                                    seqlen_k_end,
                                                    mask,

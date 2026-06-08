@@ -4,7 +4,6 @@
 #pragma once
 
 #include <ck_tile/core.hpp>
-#include <ck_tile/ops/common.hpp>
 #include <ck_tile/ops/fmha/block/block_dropout.hpp>
 
 #include <string>
@@ -13,7 +12,7 @@
 #include <variant>
 
 #include "hstu_block_masking.hpp"
-#include "hstu_attention_util.hpp"
+#include "hstu_attention_kernel_util.hpp"
 
 #ifndef HSTU_SCHED_BATCH_AS_FIRST_GRID_DIM
 #define HSTU_SCHED_BATCH_AS_FIRST_GRID_DIM 1
@@ -185,16 +184,19 @@ struct HstuAttentionFwdSplitKVKernel
         const float* group_attn_scale_ptr;
     };
 
-    struct HstuAttentionFwdCommonBiasKargs
+    struct HstuAttentionFwdBatchedBiasKargs
     {
-        const void* bias_ptr               = nullptr;
-        ck_tile::index_t seq_stride_bias   = 0;
-        ck_tile::index_t nhead_stride_bias = 0;
+        const void* bias_ptr;
+        ck_tile::index_t seq_stride_bias;
+        ck_tile::index_t nhead_stride_bias;
+        ck_tile::index_t batch_stride_bias;
     };
 
-    struct HstuAttentionFwdBatchModeBiasKargs : HstuAttentionFwdCommonBiasKargs
+    struct HstuAttentionFwdJaggedBiasKargs
     {
-        ck_tile::index_t batch_stride_bias = 0;
+        const void* bias_ptr;
+        ck_tile::index_t seq_stride_bias;
+        ck_tile::index_t nhead_stride_bias;
     };
 
     struct HstuAttentionFwdDropoutSeedOffset
@@ -228,7 +230,7 @@ struct HstuAttentionFwdSplitKVKernel
     struct HstuAttentionNoGroupBatchedFwdKargs
         : HstuAttentionNoGroupBatchedFwdBaseKargs,
           std::conditional_t<kHasBias,
-                             HstuAttentionFwdBatchModeBiasKargs,
+                             HstuAttentionFwdBatchedBiasKargs,
                              HstuAttentionFwdEmptyKargs<1>>,
           std::conditional_t<kHasDropout,
                              HstuAttentionFwdCommonDropoutKargs,
@@ -242,7 +244,7 @@ struct HstuAttentionFwdSplitKVKernel
     struct HstuAttentionNoGroupJaggedFwdKargs
         : HstuAttentionNoGroupJaggedFwdBaseKargs,
           std::conditional_t<kHasBias,
-                             HstuAttentionFwdCommonBiasKargs,
+                             HstuAttentionFwdJaggedBiasKargs,
                              HstuAttentionFwdEmptyKargs<1>>,
           std::conditional_t<kHasDropout,
                              HstuAttentionFwdCommonDropoutKargs,
@@ -255,7 +257,7 @@ struct HstuAttentionFwdSplitKVKernel
 
     struct HstuAttentionGroupFwdKargs : HstuAttentionGroupFwdBaseKargs,
                                         std::conditional_t<kHasBias,
-                                                           HstuAttentionFwdCommonBiasKargs,
+                                                           HstuAttentionFwdJaggedBiasKargs,
                                                            HstuAttentionFwdEmptyKargs<1>>,
                                         std::conditional_t<kHasDropout,
                                                            HstuAttentionFwdCommonDropoutKargs,

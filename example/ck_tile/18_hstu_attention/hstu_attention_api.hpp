@@ -3,8 +3,6 @@
 
 #pragma once
 
-#include <ck_tile/core.hpp>
-
 #include "hstu_attention_params.hpp"
 #include "hstu_attention_bwd_params.hpp"
 
