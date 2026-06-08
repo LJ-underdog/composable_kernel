@@ -18,6 +18,7 @@
 #include "hstu_attention_fwd_type_config.hpp"
 #include "hstu_attention_bwd_params.hpp"
 #include "hstu_attention_no_softmax_bwd_pipeline.hpp"
+#include "hstu_attention_with_softmax_bwd_pipeline.hpp"
 #include "hstu_attention_bwd_kernel.hpp"
 
 // HSTU attention backward — GROUP dispatch (M4: SiLU + atomic).
@@ -185,6 +186,130 @@ struct group_backward_dispatch
             n);
     }
 
+    // M5b group softmax. PRE (D=rowsum(O*dO)) -> memset dq_acc -> MAIN (group softmax
+    // kernel: per-group hyper-params + double pipeline + LSE/D) -> POST (convert dq).
+    static void RunSoftmax(HstuAttentionGroupBwdParams& param, hipStream_t stream)
+    {
+        constexpr ck_tile::index_t kPadHeadDimQ = 0;
+        constexpr ck_tile::index_t kPadHeadDimV = 0;
+
+        using LocalMask =
+            typename ck_tile::HstuBlockMasking<false /*cross*/, kUseCausal, true>::Type;
+        using NoLocalMask =
+            typename ck_tile::HstuBlockMasking<false /*cross*/, kUseCausal, false>::Type;
+
+        using PipelineLocal =
+            ck_tile::HstuAttentionWithSoftmaxBwdDQDKDVPipelineKRKTRVR<ProblemFor<LocalMask>>;
+        using PipelineNoLocal =
+            ck_tile::HstuAttentionWithSoftmaxBwdDQDKDVPipelineKRKTRVR<ProblemFor<NoLocalMask>>;
+
+        using DKEpilogue = ck_tile::Default2DEpilogue<ck_tile::Default2DEpilogueProblem<
+            typename TC::GemmAccDataType, typename TC::ODataType, false, (kPadHeadDimQ > 0)>>;
+        using DVEpilogue = ck_tile::Default2DEpilogue<ck_tile::Default2DEpilogueProblem<
+            typename TC::GemmAccDataType, typename TC::ODataType, false, (kPadHeadDimV > 0)>>;
+
+        using Kernel = ck_tile::HstuAttentionBwdDQDKDVGroupSoftmaxKernel<PipelineLocal,
+                                                                         PipelineNoLocal,
+                                                                         DKEpilogue,
+                                                                         DVEpilogue>;
+
+        // ---- PRE: D = rowsum(O .* dO). group is packed (jagged) -> token base via offsets.
+        {
+            const ck_tile::long_index_t total =
+                static_cast<ck_tile::long_index_t>(param.num_batch) * param.num_head *
+                param.max_seqlen_q;
+            constexpr int kPreThreads = 256;
+            const int pre_blocks = static_cast<int>((total + kPreThreads - 1) / kPreThreads);
+            hipLaunchKernelGGL(
+                (ck_tile::hstu_bwd_dot_do_o_kernel<InOutDataType, typename TC::CompDataType>),
+                dim3(pre_blocks),
+                dim3(kPreThreads),
+                0,
+                stream,
+                reinterpret_cast<const InOutDataType*>(param.o_ptr),
+                reinterpret_cast<const InOutDataType*>(param.do_ptr),
+                reinterpret_cast<typename TC::CompDataType*>(param.d_ptr),
+                /*is_jagged=*/true,
+                reinterpret_cast<const int32_t*>(param.seq_q_offsets_ptr),
+                param.num_batch,
+                param.num_head,
+                param.max_seqlen_q,
+                param.hdim_v,
+                static_cast<ck_tile::long_index_t>(param.seq_stride_o),
+                static_cast<ck_tile::long_index_t>(param.nhead_stride_o),
+                static_cast<ck_tile::long_index_t>(0), // packed: no batch stride
+                static_cast<ck_tile::long_index_t>(param.nhead_stride_lsed),
+                static_cast<ck_tile::long_index_t>(0));
+        }
+
+        auto kargs = Kernel::MakeKargs(param.q_ptr,
+                                       param.k_ptr,
+                                       param.v_ptr,
+                                       param.do_ptr,
+                                       param.lse_ptr,
+                                       param.d_ptr,
+                                       param.dk_ptr,
+                                       param.dv_ptr,
+                                       param.dq_acc_ptr,
+                                       param.seq_q_offsets_ptr,
+                                       param.is_cross_attention ? param.seq_kv_offsets_ptr
+                                                                : param.seq_q_offsets_ptr,
+                                       param.group_attn_scale_ptr,
+                                       param.group_max_seqlen_q_ptr,
+                                       param.group_window_size_ptr,
+                                       param.group_contextual_seqlen_ptr,
+                                       param.group_min_full_attn_seqlen_ptr,
+                                       param.num_batch / param.num_group,
+                                       param.num_targets_ptr,
+                                       param.hdim_qk,
+                                       param.hdim_v,
+                                       param.nhead_ratio_qk,
+                                       param.alpha,
+                                       param.seq_stride_q,
+                                       param.seq_stride_k,
+                                       param.seq_stride_v,
+                                       param.seq_stride_do,
+                                       param.seq_stride_dk,
+                                       param.seq_stride_dv,
+                                       param.stride_dq_acc,
+                                       param.nhead_stride_q,
+                                       param.nhead_stride_k,
+                                       param.nhead_stride_v,
+                                       param.nhead_stride_do,
+                                       param.nhead_stride_dk,
+                                       param.nhead_stride_dv,
+                                       param.nhead_stride_dq_acc,
+                                       param.nhead_stride_lsed);
+
+        HIP_CHECK_ERROR(hipMemsetAsync(param.dq_acc_ptr,
+                                       0,
+                                       static_cast<size_t>(param.total_dq_acc_elems) *
+                                           sizeof(typename TC::GemmAccDataType),
+                                       stream));
+
+        dim3 grid  = Kernel::GridSize(param.num_batch, param.num_head, param.max_seqlen_q);
+        dim3 block = Kernel::BlockSize();
+        constexpr ck_tile::index_t kBlockPerCu = Kernel::kBlockPerCu;
+
+        (void)ck_tile::launch_kernel(
+            ck_tile::stream_config{stream, false},
+            ck_tile::make_kernel<kBlockPerCu>(Kernel{}, grid, block, 0, kargs));
+
+        const ck_tile::long_index_t n =
+            static_cast<ck_tile::long_index_t>(param.total_dq_acc_elems);
+        constexpr int kPostThreads = 256;
+        const int post_blocks      = static_cast<int>((n + kPostThreads - 1) / kPostThreads);
+        hipLaunchKernelGGL(
+            (ck_tile::hstu_bwd_convert_dq_kernel<InOutDataType, typename TC::GemmAccDataType>),
+            dim3(post_blocks),
+            dim3(kPostThreads),
+            0,
+            stream,
+            reinterpret_cast<const typename TC::GemmAccDataType*>(param.dq_acc_ptr),
+            reinterpret_cast<InOutDataType*>(param.dq_ptr),
+            n);
+    }
+
     static void Run(HstuAttentionGroupBwdParams& param, hipStream_t stream)
     {
         if(param.hdim_qk != 64 || param.hdim_v != 64)
@@ -193,7 +318,7 @@ struct group_backward_dispatch
         if constexpr(kIsDeterministic)
             throw std::runtime_error("HSTU bwd: deterministic path not implemented yet (M6)");
         else if constexpr(kUseSoftmax)
-            throw std::runtime_error("HSTU bwd: softmax path not implemented yet (M5)");
+            RunSoftmax(param, stream); // M5b
         else
             RunSilu(param, stream);
     }

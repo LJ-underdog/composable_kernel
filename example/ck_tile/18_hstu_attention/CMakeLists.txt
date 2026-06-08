@@ -34,7 +34,8 @@ file(GLOB BWD_INSTANCE_SRCS instances/*backward*.cpp)
 file(GLOB FWD_BF16_INSTANCE_SRCS instances/*forward_bf16*.cpp)
 set(BWD_INTERFACES_SRCS hstu_attention_no_group_backward_bf16.cpp
                         hstu_attention_group_backward_bf16.cpp
-                        hstu_attention_no_group_forward_bf16.cpp)
+                        hstu_attention_no_group_forward_bf16.cpp
+                        hstu_attention_group_forward_bf16.cpp)
 add_executable(${EXAMPLE_HSTU_ATTENTION_BWD} EXCLUDE_FROM_ALL example_hstu_attention_bwd.cpp)
 target_include_directories(${EXAMPLE_HSTU_ATTENTION_BWD} PRIVATE ${CMAKE_CURRENT_LIST_DIR})
 target_sources(${EXAMPLE_HSTU_ATTENTION_BWD} PRIVATE ${BWD_INTERFACES_SRCS} ${BWD_INSTANCE_SRCS} ${FWD_BF16_INSTANCE_SRCS})

@@ -1201,6 +1201,365 @@ struct HstuAttentionBwdDQDKDVGroupKernel
     }
 };
 
+// ---------------------------------------------------------------------------
+// HSTU bwd MAIN kernel — GROUP + SOFTMAX (M5b). = M4 group kernel (per-group
+// hyper-params via i_group + jagged offsets + runtime with-local/without-local
+// pipeline branch) FUSED WITH M5 softmax (LSE/D dram windows + softmax pipeline,
+// no scale_p). group is always packed (jagged), so LSE/D base = i_nhead*ΣL +
+// query_start (seq stride 1), identical to the M5 jagged path.
+template <typename PipelineLocal_,
+          typename PipelineNoLocal_,
+          typename KGradEpiloguePipeline_,
+          typename VGradEpiloguePipeline_>
+struct HstuAttentionBwdDQDKDVGroupSoftmaxKernel
+{
+    using PipelineLocal         = remove_cvref_t<PipelineLocal_>;
+    using PipelineNoLocal       = remove_cvref_t<PipelineNoLocal_>;
+    using KGradEpiloguePipeline = remove_cvref_t<KGradEpiloguePipeline_>;
+    using VGradEpiloguePipeline = remove_cvref_t<VGradEpiloguePipeline_>;
+
+    using P = PipelineLocal;
+
+    static constexpr index_t kBlockSize  = P::kBlockSize;
+    static constexpr index_t kBlockPerCu = P::kBlockPerCu;
+
+    using QDataType     = remove_cvref_t<typename P::QDataType>;
+    using KDataType     = remove_cvref_t<typename P::KDataType>;
+    using VDataType     = remove_cvref_t<typename P::VDataType>;
+    using AccDataType   = remove_cvref_t<typename P::AccDataType>;
+    using OGradDataType = remove_cvref_t<typename P::OGradDataType>;
+    using KGradDataType = remove_cvref_t<typename P::KGradDataType>;
+    using VGradDataType = remove_cvref_t<typename P::VGradDataType>;
+    using LSEDataType   = remove_cvref_t<typename P::LSEDataType>;
+    using DDataType     = remove_cvref_t<typename P::DDataType>;
+    using LocalMask     = remove_cvref_t<typename PipelineLocal::FmhaMask>;
+    using NoLocalMask   = remove_cvref_t<typename PipelineNoLocal::FmhaMask>;
+
+    static constexpr index_t kPadHeadDimQ  = P::kPadHeadDimQ;
+    static constexpr index_t kPadHeadDimV  = P::kPadHeadDimV;
+    static constexpr bool kIsDeterministic = P::kIsDeterministic;
+
+    struct Kargs
+    {
+        const void* q_ptr;
+        const void* k_ptr;
+        const void* v_ptr;
+        const void* do_ptr;
+        const void* lse_ptr;
+        const void* d_ptr;
+        void* dk_ptr;
+        void* dv_ptr;
+        void* dq_acc_ptr; // float
+
+        const void* seq_q_offsets_ptr;
+        const void* seq_kv_offsets_ptr;
+
+        const void* group_attn_scale_ptr;
+        const void* group_max_seqlen_q_ptr;
+        const void* group_window_size_ptr;
+        const void* group_contextual_seqlen_ptr;
+        const void* group_min_full_attn_seqlen_ptr;
+        index_t num_batch_per_group;
+
+        const void* num_targets_ptr;
+
+        index_t hdim_qk;
+        index_t hdim_v;
+        index_t nhead_ratio_qk;
+
+        float alpha; // global
+
+        index_t stride_q;
+        index_t stride_k;
+        index_t stride_v;
+        index_t stride_do;
+        index_t stride_dk;
+        index_t stride_dv;
+        index_t stride_dq_acc;
+
+        index_t nhead_stride_q;
+        index_t nhead_stride_k;
+        index_t nhead_stride_v;
+        index_t nhead_stride_do;
+        index_t nhead_stride_dk;
+        index_t nhead_stride_dv;
+        index_t nhead_stride_dq_acc;
+        index_t nhead_stride_lsed; // LSE and D share this (== ΣL packed)
+    };
+
+    CK_TILE_HOST static constexpr Kargs MakeKargs(const void* q_ptr,
+                                                  const void* k_ptr,
+                                                  const void* v_ptr,
+                                                  const void* do_ptr,
+                                                  const void* lse_ptr,
+                                                  const void* d_ptr,
+                                                  void* dk_ptr,
+                                                  void* dv_ptr,
+                                                  void* dq_acc_ptr,
+                                                  const void* seq_q_offsets_ptr,
+                                                  const void* seq_kv_offsets_ptr,
+                                                  const void* group_attn_scale_ptr,
+                                                  const void* group_max_seqlen_q_ptr,
+                                                  const void* group_window_size_ptr,
+                                                  const void* group_contextual_seqlen_ptr,
+                                                  const void* group_min_full_attn_seqlen_ptr,
+                                                  index_t num_batch_per_group,
+                                                  const void* num_targets_ptr,
+                                                  index_t hdim_qk,
+                                                  index_t hdim_v,
+                                                  index_t nhead_ratio_qk,
+                                                  float alpha,
+                                                  index_t stride_q,
+                                                  index_t stride_k,
+                                                  index_t stride_v,
+                                                  index_t stride_do,
+                                                  index_t stride_dk,
+                                                  index_t stride_dv,
+                                                  index_t stride_dq_acc,
+                                                  index_t nhead_stride_q,
+                                                  index_t nhead_stride_k,
+                                                  index_t nhead_stride_v,
+                                                  index_t nhead_stride_do,
+                                                  index_t nhead_stride_dk,
+                                                  index_t nhead_stride_dv,
+                                                  index_t nhead_stride_dq_acc,
+                                                  index_t nhead_stride_lsed)
+    {
+        Kargs k;
+        k.q_ptr                          = q_ptr;
+        k.k_ptr                          = k_ptr;
+        k.v_ptr                          = v_ptr;
+        k.do_ptr                         = do_ptr;
+        k.lse_ptr                        = lse_ptr;
+        k.d_ptr                          = d_ptr;
+        k.dk_ptr                         = dk_ptr;
+        k.dv_ptr                         = dv_ptr;
+        k.dq_acc_ptr                     = dq_acc_ptr;
+        k.seq_q_offsets_ptr              = seq_q_offsets_ptr;
+        k.seq_kv_offsets_ptr             = seq_kv_offsets_ptr;
+        k.group_attn_scale_ptr           = group_attn_scale_ptr;
+        k.group_max_seqlen_q_ptr         = group_max_seqlen_q_ptr;
+        k.group_window_size_ptr          = group_window_size_ptr;
+        k.group_contextual_seqlen_ptr    = group_contextual_seqlen_ptr;
+        k.group_min_full_attn_seqlen_ptr = group_min_full_attn_seqlen_ptr;
+        k.num_batch_per_group            = num_batch_per_group;
+        k.num_targets_ptr                = num_targets_ptr;
+        k.hdim_qk                        = hdim_qk;
+        k.hdim_v                         = hdim_v;
+        k.nhead_ratio_qk                 = nhead_ratio_qk;
+        k.alpha                          = alpha;
+        k.stride_q                       = stride_q;
+        k.stride_k                       = stride_k;
+        k.stride_v                       = stride_v;
+        k.stride_do                      = stride_do;
+        k.stride_dk                      = stride_dk;
+        k.stride_dv                      = stride_dv;
+        k.stride_dq_acc                  = stride_dq_acc;
+        k.nhead_stride_q                 = nhead_stride_q;
+        k.nhead_stride_k                 = nhead_stride_k;
+        k.nhead_stride_v                 = nhead_stride_v;
+        k.nhead_stride_do                = nhead_stride_do;
+        k.nhead_stride_dk                = nhead_stride_dk;
+        k.nhead_stride_dv                = nhead_stride_dv;
+        k.nhead_stride_dq_acc            = nhead_stride_dq_acc;
+        k.nhead_stride_lsed              = nhead_stride_lsed;
+        return k;
+    }
+
+    CK_TILE_HOST static constexpr auto
+    GridSize(index_t batch_size, index_t nhead, index_t max_seqlen_kv)
+    {
+        return dim3(integer_divide_ceil(max_seqlen_kv, P::kN0), nhead, batch_size);
+    }
+
+    CK_TILE_DEVICE static constexpr auto GetTileIndex()
+    {
+        return make_tuple(static_cast<index_t>(blockIdx.x),
+                          static_cast<index_t>(blockIdx.y),
+                          static_cast<index_t>(blockIdx.z));
+    }
+
+    CK_TILE_HOST static constexpr auto BlockSize() { return dim3(kBlockSize); }
+
+    CK_TILE_HOST_DEVICE static constexpr index_t GetSmemSize()
+    {
+        return max(PipelineLocal::GetSmemSize(),
+                   PipelineNoLocal::GetSmemSize(),
+                   KGradEpiloguePipeline::GetSmemSize(),
+                   VGradEpiloguePipeline::GetSmemSize());
+    }
+
+    CK_TILE_DEVICE void operator()(Kargs kargs) const
+    {
+        __shared__ char smem_ptr[GetSmemSize()];
+
+        const auto [i_tile_n, i_nhead, i_batch] = GetTileIndex();
+        const index_t i_n0 = __builtin_amdgcn_readfirstlane(i_tile_n * P::kN0);
+
+        const auto* q_offsets  = reinterpret_cast<const int32_t*>(kargs.seq_q_offsets_ptr);
+        const auto* kv_offsets = reinterpret_cast<const int32_t*>(kargs.seq_kv_offsets_ptr);
+        const long_index_t query_start = q_offsets[i_batch];
+        const long_index_t key_start   = kv_offsets[i_batch];
+        const index_t seqlen_q  = q_offsets[i_batch + 1] - q_offsets[i_batch];
+        const index_t seqlen_kv = kv_offsets[i_batch + 1] - kv_offsets[i_batch];
+
+        if(i_n0 >= seqlen_kv)
+            return;
+
+        // per-group hyper-params (D6). softmax: scale_p unused, but window/contextual/
+        // min_full are still per-group; scale_p replaced by LSE.
+        const index_t i_group =
+            __builtin_amdgcn_readfirstlane(i_batch / kargs.num_batch_per_group);
+        const index_t window_size =
+            reinterpret_cast<const int32_t*>(kargs.group_window_size_ptr)[i_group];
+        const index_t contextual_seqlen =
+            reinterpret_cast<const int32_t*>(kargs.group_contextual_seqlen_ptr)[i_group];
+        const index_t min_full_attn_seqlen =
+            reinterpret_cast<const int32_t*>(kargs.group_min_full_attn_seqlen_ptr)[i_group];
+
+        const int num_target =
+            (kargs.num_targets_ptr != nullptr)
+                ? reinterpret_cast<const int32_t*>(kargs.num_targets_ptr)[i_batch]
+                : 0;
+
+        const long_index_t batch_offset_q      = query_start * kargs.stride_q;
+        const long_index_t batch_offset_k      = key_start * kargs.stride_k;
+        const long_index_t batch_offset_v      = key_start * kargs.stride_v;
+        const long_index_t batch_offset_do     = query_start * kargs.stride_do;
+        const long_index_t batch_offset_dk     = key_start * kargs.stride_dk;
+        const long_index_t batch_offset_dv     = key_start * kargs.stride_dv;
+        const long_index_t batch_offset_dq_acc = query_start * kargs.stride_dq_acc;
+        const long_index_t batch_offset_lsed   = query_start; // LSE/D seq stride 1 (packed)
+
+        const QDataType* q_ptr = reinterpret_cast<const QDataType*>(kargs.q_ptr) +
+                                 static_cast<long_index_t>(i_nhead) * kargs.nhead_stride_q +
+                                 batch_offset_q;
+        const KDataType* k_ptr =
+            reinterpret_cast<const KDataType*>(kargs.k_ptr) +
+            static_cast<long_index_t>(i_nhead / kargs.nhead_ratio_qk) * kargs.nhead_stride_k +
+            batch_offset_k;
+        const VDataType* v_ptr =
+            reinterpret_cast<const VDataType*>(kargs.v_ptr) +
+            static_cast<long_index_t>(i_nhead / kargs.nhead_ratio_qk) * kargs.nhead_stride_v +
+            batch_offset_v;
+        const OGradDataType* do_ptr = reinterpret_cast<const OGradDataType*>(kargs.do_ptr) +
+                                      static_cast<long_index_t>(i_nhead) * kargs.nhead_stride_do +
+                                      batch_offset_do;
+        const LSEDataType* lse_ptr = reinterpret_cast<const LSEDataType*>(kargs.lse_ptr) +
+                                     static_cast<long_index_t>(i_nhead) * kargs.nhead_stride_lsed +
+                                     batch_offset_lsed;
+        const DDataType* d_ptr = reinterpret_cast<const DDataType*>(kargs.d_ptr) +
+                                 static_cast<long_index_t>(i_nhead) * kargs.nhead_stride_lsed +
+                                 batch_offset_lsed;
+        KGradDataType* dk_ptr = reinterpret_cast<KGradDataType*>(kargs.dk_ptr) +
+                                static_cast<long_index_t>(i_nhead) * kargs.nhead_stride_dk +
+                                batch_offset_dk;
+        VGradDataType* dv_ptr = reinterpret_cast<VGradDataType*>(kargs.dv_ptr) +
+                                static_cast<long_index_t>(i_nhead) * kargs.nhead_stride_dv +
+                                batch_offset_dv;
+
+        const auto q_dram = pad_tensor_view(
+            make_naive_tensor_view<address_space_enum::global>(
+                q_ptr, make_tuple(seqlen_q, kargs.hdim_qk), make_tuple(kargs.stride_q, 1),
+                number<P::kAlignmentQ>{}, number<1>{}),
+            make_tuple(number<P::kM0>{}, number<P::kQKHeaddim>{}),
+            sequence<false, (kPadHeadDimQ > 0)>{});
+        const auto k_dram = pad_tensor_view(
+            make_naive_tensor_view<address_space_enum::global>(
+                k_ptr, make_tuple(seqlen_kv, kargs.hdim_qk), make_tuple(kargs.stride_k, 1),
+                number<P::kAlignmentK>{}, number<1>{}),
+            make_tuple(number<P::kN0>{}, number<P::kQKHeaddim>{}),
+            sequence<false, (kPadHeadDimQ > 0)>{});
+        const auto v_dram = pad_tensor_view(
+            make_naive_tensor_view<address_space_enum::global>(
+                v_ptr, make_tuple(seqlen_kv, kargs.hdim_v), make_tuple(kargs.stride_v, 1),
+                number<P::kAlignmentV>{}, number<1>{}),
+            make_tuple(number<P::kN0>{}, number<P::kVHeaddim>{}),
+            sequence<false, (kPadHeadDimV > 0)>{});
+        const auto do_dram = pad_tensor_view(
+            make_naive_tensor_view<address_space_enum::global>(
+                do_ptr, make_tuple(seqlen_q, kargs.hdim_v), make_tuple(kargs.stride_do, 1),
+                number<P::kAlignmentOGrad>{}, number<1>{}),
+            make_tuple(number<P::kM0>{}, number<P::kVHeaddim>{}),
+            sequence<false, (kPadHeadDimV > 0)>{});
+
+        const auto lse_dram = make_naive_tensor_view_packed<address_space_enum::global>(
+            lse_ptr, make_tuple(seqlen_q), number<P::kM0>{});
+        const auto d_dram = make_naive_tensor_view_packed<address_space_enum::global>(
+            d_ptr, make_tuple(seqlen_q), number<P::kM0>{});
+
+        auto q_dram_window = make_tile_window(
+            q_dram, make_tuple(number<P::kM0>{}, number<P::kQKHeaddim>{}), {0, 0});
+        auto k_dram_window = make_tile_window(
+            k_dram, make_tuple(number<P::kN0>{}, number<P::kQKHeaddim>{}), {i_n0, 0});
+        auto v_dram_window = make_tile_window(
+            v_dram, make_tuple(number<P::kN0>{}, number<P::kVHeaddim>{}), {i_n0, 0});
+        auto do_dram_window = make_tile_window(
+            do_dram, make_tuple(number<P::kM0>{}, number<P::kVHeaddim>{}), {0, 0});
+        auto lse_dram_window = make_tile_window(lse_dram, make_tuple(number<P::kM0>{}), {0});
+        auto d_dram_window   = make_tile_window(d_dram, make_tuple(number<P::kM0>{}), {0});
+
+        AccDataType* dq_acc_ptr =
+            reinterpret_cast<AccDataType*>(kargs.dq_acc_ptr) +
+            static_cast<long_index_t>(i_nhead) * kargs.nhead_stride_dq_acc + batch_offset_dq_acc;
+        auto dq_acc_dram = pad_tensor_view(
+            make_naive_tensor_view<address_space_enum::global, memory_operation_enum::atomic_add>(
+                dq_acc_ptr, make_tuple(seqlen_q, kargs.hdim_qk),
+                make_tuple(kargs.stride_dq_acc, 1), number<P::kAlignmentQGrad>{}, number<1>{}),
+            make_tuple(number<P::kM0>{}, number<P::kQKHeaddim>{}),
+            sequence<false, (kPadHeadDimQ > 0)>{});
+        auto dq_dram_window = make_tile_window(
+            dq_acc_dram, make_tuple(number<P::kM0>{}, number<P::kQKHeaddim>{}), {0, 0});
+
+        auto write_dkdv = [&](auto& dk_acc_tile, auto& dv_acc_tile) {
+            auto dk_dram = pad_tensor_view(
+                make_naive_tensor_view<address_space_enum::global>(
+                    dk_ptr, make_tuple(seqlen_kv, kargs.hdim_qk), make_tuple(kargs.stride_dk, 1),
+                    number<P::kAlignmentKGrad>{}, number<1>{}),
+                make_tuple(number<P::kN0>{}, number<P::kQKHeaddim>{}),
+                sequence<false, (kPadHeadDimQ > 0)>{});
+            auto dv_dram = pad_tensor_view(
+                make_naive_tensor_view<address_space_enum::global>(
+                    dv_ptr, make_tuple(seqlen_kv, kargs.hdim_v), make_tuple(kargs.stride_dv, 1),
+                    number<P::kAlignmentVGrad>{}, number<1>{}),
+                make_tuple(number<P::kN0>{}, number<P::kVHeaddim>{}),
+                sequence<false, (kPadHeadDimV > 0)>{});
+            auto dk_dram_window = make_tile_window(
+                dk_dram, make_tuple(number<P::kN0>{}, number<P::kQKHeaddim>{}), {i_n0, 0});
+            auto dv_dram_window = make_tile_window(
+                dv_dram, make_tuple(number<P::kN0>{}, number<P::kVHeaddim>{}), {i_n0, 0});
+            KGradEpiloguePipeline{}(dk_dram_window, dk_acc_tile, nullptr);
+            VGradEpiloguePipeline{}(dv_dram_window, dv_acc_tile, nullptr);
+        };
+
+        // per-group window decides which mask type / softmax pipeline runs at runtime
+        if(window_size > 0)
+        {
+            const int eff_min_full = (seqlen_q - num_target > min_full_attn_seqlen)
+                                         ? min_full_attn_seqlen
+                                         : (seqlen_q - num_target);
+            auto mask = make_hstu_self_attention_block_mask_with_local<LocalMask>(
+                /*is_tile_in_first_split=*/true, seqlen_q, contextual_seqlen, num_target,
+                window_size, eff_min_full);
+            auto [dk_acc_tile, dv_acc_tile] =
+                PipelineLocal{}(q_dram_window, k_dram_window, v_dram_window, do_dram_window,
+                                lse_dram_window, d_dram_window, dq_dram_window, mask, kargs.alpha,
+                                smem_ptr);
+            write_dkdv(dk_acc_tile, dv_acc_tile);
+        }
+        else
+        {
+            auto mask = make_hstu_self_attention_block_mask_without_local<NoLocalMask>(
+                seqlen_q, contextual_seqlen, num_target);
+            auto [dk_acc_tile, dv_acc_tile] =
+                PipelineNoLocal{}(q_dram_window, k_dram_window, v_dram_window, do_dram_window,
+                                  lse_dram_window, d_dram_window, dq_dram_window, mask, kargs.alpha,
+                                  smem_ptr);
+            write_dkdv(dk_acc_tile, dv_acc_tile);
+        }
+    }
+};
+
 // PRE (softmax path): D[b,h,sq] = Σ_v O[b,sq,h,v] * dO[b,sq,h,v]  (DESIGN §1.1).
 // One thread per (i_batch, i_nhead, sq) row. O/dO are in their [batch,seq,head,hdim]
 // layout (jagged: [1,ΣL,head,hdim] via q offsets); D is written [batch,head,seq]
