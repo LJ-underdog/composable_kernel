@@ -161,7 +161,11 @@ struct HstuAttentionGroupBwdParams
     ck_tile::index_t seq_stride_do;
     ck_tile::index_t nhead_stride_do;
 
-    const void* lse_ptr; // softmax path only
+    const void* lse_ptr; // softmax path only (M5b); [head, ΣL] seq-continuous packed
+
+    // ---- softmax PRE output (M5b): D = rowsum(O*dO), same [head,ΣL] layout as LSE ----
+    void* d_ptr;                          // softmax path only
+    ck_tile::index_t nhead_stride_lsed;   // == ΣL (group packed; LSE/D seq stride is 1)
 
     // ---- bwd outputs: dQ/dK/dV ----------------------------------------------
     void* dq_ptr;

@@ -737,6 +737,14 @@ bool run_group_hstu_bwd(const ck_tile::ArgParser& arg_parser, int num_group)
         static_cast<size_t>(batches_for_alloc) * phy_seqlen_q * num_head * hdim_qk;
     ck_tile::DeviceMem dq_acc_dev(dq_acc_elems * sizeof(CompDataType));
 
+    // softmax (M5b): O (fwd output, used by PRE for D), LSE (fwd), D (PRE). group is
+    // packed -> LSE/D layout [head, ΣL] (seq-continuous), nhead_stride_lsed = ΣL.
+    const size_t lsed_elems = static_cast<size_t>(num_head) * phy_seqlen_q;
+    const ck_tile::index_t nhead_stride_lsed = phy_seqlen_q;
+    ck_tile::DeviceMem o_dev(o_host.get_element_space_size_in_bytes());
+    ck_tile::DeviceMem lse_dev(lsed_elems * sizeof(CompDataType));
+    ck_tile::DeviceMem d_dev(lsed_elems * sizeof(CompDataType));
+
     q_dev.ToDevice(q_host.data());
     k_dev.ToDevice(k_host.data());
     v_dev.ToDevice(v_host.data());
@@ -756,6 +764,69 @@ bool run_group_hstu_bwd(const ck_tile::ArgParser& arg_parser, int num_group)
     hipStream_t stream;
     HIP_CHECK_ERROR(hipStreamCreate(&stream));
 
+    // ---- GPU group forward (softmax only): produce O + LSE. SiLU skips this (O unused).
+    //      LSE stored [head, ΣL] seq-continuous (packed) so group bwd reads it directly;
+    //      transposed into lse_host [1, ΣL, head] for the reference.
+    if(use_softmax)
+    {
+        HstuAttentionGroupFwdParams fp{};
+        fp.is_cross_attention = is_cross_attention;
+        fp.use_softmax        = true;
+        fp.is_training        = true;
+        fp.num_group          = num_group;
+        fp.num_batch          = num_batch;
+        fp.seq_q_offsets_ptr  = seq_offsets_q_dev.GetDeviceBuffer();
+        fp.seq_kv_offsets_ptr = seq_offsets_q_dev.GetDeviceBuffer();
+        fp.max_seqlen_q       = max_max_seqlen_q;
+        fp.q_ptr              = q_dev.GetDeviceBuffer();
+        fp.k_ptr              = k_dev.GetDeviceBuffer();
+        fp.v_ptr              = v_dev.GetDeviceBuffer();
+        fp.bias_ptr           = nullptr;
+        fp.o_ptr              = o_dev.GetDeviceBuffer();
+        fp.lse_ptr            = lse_dev.GetDeviceBuffer();
+        fp.hdim_qk            = hdim_qk;
+        fp.hdim_v             = hdim_v;
+        fp.num_head           = num_head;
+        fp.scale_s            = scale_s;
+        fp.seq_stride_q       = q_host.get_strides()[1];
+        fp.seq_stride_k       = k_host.get_strides()[1];
+        fp.seq_stride_v       = v_host.get_strides()[1];
+        fp.seq_stride_bias    = 0;
+        fp.seq_stride_o       = o_host.get_strides()[1];
+        fp.seq_stride_lse     = 1;
+        fp.nhead_stride_q     = q_host.get_strides()[2];
+        fp.nhead_stride_k     = k_host.get_strides()[2];
+        fp.nhead_stride_v     = v_host.get_strides()[2];
+        fp.nhead_stride_bias  = 0;
+        fp.nhead_stride_o     = o_host.get_strides()[2];
+        fp.nhead_stride_lse   = nhead_stride_lsed;
+        fp.num_targets_ptr = num_targets.empty() ? nullptr : num_targets_dev.GetDeviceBuffer();
+        fp.use_causal         = use_causal;
+        fp.group_attn_scale_ptr           = group_attn_scales_dev.GetDeviceBuffer();
+        fp.group_max_seqlen_q_ptr         = group_max_seqlens_q_dev.GetDeviceBuffer();
+        fp.group_window_size_ptr          = group_window_sizes_dev.GetDeviceBuffer();
+        fp.group_contextual_seqlen_ptr    = group_contextual_seqlens_dev.GetDeviceBuffer();
+        fp.group_min_full_attn_seqlen_ptr = group_min_full_attn_seqlens_dev.GetDeviceBuffer();
+        fp.p_drop             = 0.0f;
+        fp.philox_seed        = 0UL;
+        fp.philox_offset      = 0UL;
+
+        if constexpr(std::is_same<InOutDataType, ck_tile::bf16_t>::value)
+            hstu_attention_group_forward_bf16(fp, stream);
+        else
+            throw std::runtime_error("group bwd harness only wires the bf16 forward path");
+
+        HIP_CHECK_ERROR(hipStreamSynchronize(stream));
+        o_dev.FromDevice(o_host.data());
+
+        // transpose GPU LSE ([head, ΣL]) -> reference layout lse_host ([1, ΣL, head])
+        std::vector<CompDataType> lse_flat(lsed_elems);
+        lse_dev.FromDevice(lse_flat.data());
+        for(int h = 0; h < num_head; h++)
+            for(int s = 0; s < phy_seqlen_q; s++)
+                lse_host(0, s, h) = lse_flat[static_cast<size_t>(h) * phy_seqlen_q + s];
+    }
+
     // ---- GPU backward (group) ------------------------------------------------
     {
         HstuAttentionGroupBwdParams bp{};
@@ -768,7 +839,8 @@ bool run_group_hstu_bwd(const ck_tile::ArgParser& arg_parser, int num_group)
         bp.q_ptr              = q_dev.GetDeviceBuffer();
         bp.k_ptr              = k_dev.GetDeviceBuffer();
         bp.v_ptr              = v_dev.GetDeviceBuffer();
-        bp.o_ptr              = nullptr; // SiLU: O unused
+        // softmax (M5b): O fed to PRE for D. SiLU: O unused.
+        bp.o_ptr              = use_softmax ? o_dev.GetDeviceBuffer() : nullptr;
         bp.hdim_qk            = hdim_qk;
         bp.hdim_v             = hdim_v;
         bp.num_head           = num_head;
@@ -795,7 +867,10 @@ bool run_group_hstu_bwd(const ck_tile::ArgParser& arg_parser, int num_group)
         bp.do_ptr          = do_dev.GetDeviceBuffer();
         bp.seq_stride_do   = do_host.get_strides()[1];
         bp.nhead_stride_do = do_host.get_strides()[2];
-        bp.lse_ptr         = nullptr;
+        // softmax (M5b): LSE (fwd) + D (PRE), [head, ΣL] packed. SiLU: null.
+        bp.lse_ptr           = use_softmax ? lse_dev.GetDeviceBuffer() : nullptr;
+        bp.d_ptr             = use_softmax ? d_dev.GetDeviceBuffer() : nullptr;
+        bp.nhead_stride_lsed = nhead_stride_lsed;
 
         bp.dq_ptr          = dq_dev.GetDeviceBuffer();
         bp.dk_ptr          = dk_dev.GetDeviceBuffer();
