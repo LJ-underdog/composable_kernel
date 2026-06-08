@@ -299,6 +299,16 @@ bool run_no_group_hstu_bwd(const ck_tile::ArgParser& arg_parser)
         static_cast<size_t>(batches_for_alloc) * phy_seqlen_q * num_head * hdim_qk;
     ck_tile::DeviceMem dq_acc_dev(dq_acc_elems * sizeof(CompDataType));
 
+    // LSE (fwd output) + D (PRE output), softmax path only. Layout [batch,head,seq]
+    // (seq-continuous; jagged: [head,ΣL]). nhead_stride_lsed=phy_seqlen_q,
+    // batch_stride_lsed=num_head*phy_seqlen_q. Allocated unconditionally (cheap).
+    const size_t lsed_elems =
+        static_cast<size_t>(batches_for_alloc) * num_head * phy_seqlen_q;
+    const ck_tile::index_t nhead_stride_lsed = phy_seqlen_q;
+    const ck_tile::index_t batch_stride_lsed = num_head * phy_seqlen_q;
+    ck_tile::DeviceMem lse_dev(lsed_elems * sizeof(CompDataType));
+    ck_tile::DeviceMem d_dev(lsed_elems * sizeof(CompDataType));
+
     q_dev.ToDevice(q_host.data());
     k_dev.ToDevice(k_host.data());
     v_dev.ToDevice(v_host.data());
@@ -351,9 +361,13 @@ bool run_no_group_hstu_bwd(const ck_tile::ArgParser& arg_parser)
         fp.batch_stride_o     = o_host.get_strides()[0];
         fp.num_targets_ptr = num_targets.empty() ? nullptr : num_targets_dev.GetDeviceBuffer();
         fp.use_softmax        = use_softmax;
-        // M5 baseline (SiLU): no LSE storage. M5 softmax wiring sets these below.
-        fp.is_training        = false;
-        fp.lse_ptr            = nullptr;
+        // M5: softmax needs fwd to store LSE (natural log) in [batch,head,seq]
+        // seq-continuous layout so bwd reads it directly (jagged: token base via offsets).
+        fp.is_training        = use_softmax;
+        fp.lse_ptr            = use_softmax ? lse_dev.GetDeviceBuffer() : nullptr;
+        fp.seq_stride_lse     = 1;
+        fp.nhead_stride_lse   = nhead_stride_lsed;
+        fp.batch_stride_lse   = batch_stride_lsed;
         fp.use_causal         = use_causal;
         fp.window_size        = window_size;
         fp.contextual_seqlen  = contextual_seqlen;
@@ -369,6 +383,20 @@ bool run_no_group_hstu_bwd(const ck_tile::ArgParser& arg_parser)
 
         HIP_CHECK_ERROR(hipStreamSynchronize(stream));
         o_dev.FromDevice(o_host.data());
+
+        // softmax: pull the GPU LSE ([batch,head,seq]) and transpose into the reference's
+        // [batch,seq,head] layout (lse_host) so CPU bwd consumes the SAME LSE the GPU bwd
+        // reads. (Critical: mismatched layout would be silently wrong.)
+        if(use_softmax)
+        {
+            std::vector<CompDataType> lse_flat(lsed_elems);
+            lse_dev.FromDevice(lse_flat.data());
+            for(int b = 0; b < batches_for_alloc; b++)
+                for(int h = 0; h < num_head; h++)
+                    for(int s = 0; s < phy_seqlen_q; s++)
+                        lse_host(b, s, h) =
+                            lse_flat[(static_cast<size_t>(b) * num_head + h) * phy_seqlen_q + s];
+        }
     }
 
     // ---- (2) GPU backward (M0 scaffold: zeroes dQ/dK/dV) ---------------------
@@ -416,7 +444,8 @@ bool run_no_group_hstu_bwd(const ck_tile::ArgParser& arg_parser)
         bp.seq_stride_do    = do_host.get_strides()[1];
         bp.nhead_stride_do  = do_host.get_strides()[2];
         bp.batch_stride_do  = do_host.get_strides()[0];
-        bp.lse_ptr          = nullptr; // SiLU path
+        // softmax (M5): LSE (fwd-stored) + D (PRE) in [batch,head,seq] layout. SiLU: null.
+        bp.lse_ptr          = use_softmax ? lse_dev.GetDeviceBuffer() : nullptr;
 
         bp.dq_ptr         = dq_dev.GetDeviceBuffer();
         bp.dk_ptr         = dk_dev.GetDeviceBuffer();
@@ -431,9 +460,9 @@ bool run_no_group_hstu_bwd(const ck_tile::ArgParser& arg_parser)
         bp.batch_stride_dk = dk_host.get_strides()[0];
         bp.batch_stride_dv = dv_host.get_strides()[0];
 
-        bp.d_ptr               = nullptr;
-        bp.nhead_stride_lsed   = 0;
-        bp.batch_stride_lsed   = 0;
+        bp.d_ptr               = use_softmax ? d_dev.GetDeviceBuffer() : nullptr;
+        bp.nhead_stride_lsed   = nhead_stride_lsed;
+        bp.batch_stride_lsed   = batch_stride_lsed;
         bp.dq_acc_ptr          = dq_acc_dev.GetDeviceBuffer();
         bp.stride_dq_acc       = dq_host.get_strides()[1]; // same layout as dQ
         bp.nhead_stride_dq_acc = dq_host.get_strides()[2];

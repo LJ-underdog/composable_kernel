@@ -18,6 +18,7 @@
 #include "hstu_attention_fwd_type_config.hpp"
 #include "hstu_attention_bwd_params.hpp"
 #include "hstu_attention_no_softmax_bwd_pipeline.hpp"
+#include "hstu_attention_with_softmax_bwd_pipeline.hpp"
 #include "hstu_attention_bwd_kernel.hpp"
 
 // HSTU attention backward — batched NoGroup dispatch (M1: SiLU + no-mask + atomic).
@@ -206,11 +207,175 @@ struct batched_backward_dispatch
             n);
     }
 
+    // M5 softmax path (no_group = batched + jagged). PRE (D=rowsum(O*dO)) -> memset
+    // dq_acc -> MAIN (softmax pipeline, reads LSE+D) -> POST (convert dq_acc->dq).
+    template <typename Mask>
+    static void RunSoftmax(HstuAttentionNoGroupBwdParams& param, hipStream_t stream)
+    {
+        constexpr ck_tile::index_t kPadHeadDimQ = 0;
+        constexpr ck_tile::index_t kPadHeadDimV = 0;
+        constexpr ck_tile::index_t occupancy    = 1;
+
+        using Traits = ck_tile::TileFmhaBwdTraits<kPadHeadDimQ,
+                                                  kPadHeadDimV,
+                                                  ck_tile::BlockAttentionBiasEnum::NO_BIAS,
+                                                  false,
+                                                  occupancy>;
+        using Dropout = ck_tile::BlockDropoutBwd<false, true, false>;
+
+        using Problem = ck_tile::BlockFmhaBwdPipelineProblem<
+            typename TC::ODataType,
+            typename TC::ODataType,
+            typename TC::ODataType,
+            typename TC::ODataType,
+            typename TC::CompDataType,    // LSEDataType (real on softmax path)
+            typename TC::GemmAccDataType,
+            typename TC::CompDataType,    // DDataType (real on softmax path)
+            typename TC::BiasDataType,
+            uint8_t,
+            typename TC::ODataType,
+            typename TC::ODataType,
+            typename TC::ODataType,
+            typename TC::ODataType,
+            typename TC::ODataType,
+            typename TC::BiasDataType,
+            FmhaBwdShape,
+            false, // kIsGroupMode
+            false, // kIsDeterministic
+            Mask,
+            Dropout,
+            false, // kUseTrLoad
+            Traits>;
+
+        using Pipeline = ck_tile::HstuAttentionWithSoftmaxBwdDQDKDVPipelineKRKTRVR<Problem>;
+
+        using DKEpilogue = ck_tile::Default2DEpilogue<ck_tile::Default2DEpilogueProblem<
+            typename TC::GemmAccDataType, typename TC::ODataType, false, (kPadHeadDimQ > 0)>>;
+        using DVEpilogue = ck_tile::Default2DEpilogue<ck_tile::Default2DEpilogueProblem<
+            typename TC::GemmAccDataType, typename TC::ODataType, false, (kPadHeadDimV > 0)>>;
+
+        using Kernel =
+            ck_tile::HstuAttentionBwdDQDKDVSoftmaxKernel<Pipeline, DKEpilogue, DVEpilogue>;
+
+        // ---- PRE: D = rowsum(O .* dO) -> param.d_ptr ([batch,head,seq] layout) ----
+        const ck_tile::index_t grid_seqlen =
+            param.is_jagged ? param.max_seqlen_q : param.seqlen_q;
+        {
+            const ck_tile::long_index_t total =
+                static_cast<ck_tile::long_index_t>(param.num_batch) * param.num_head * grid_seqlen;
+            constexpr int kPreThreads = 256;
+            const int pre_blocks = static_cast<int>((total + kPreThreads - 1) / kPreThreads);
+            hipLaunchKernelGGL(
+                (ck_tile::hstu_bwd_dot_do_o_kernel<InOutDataType, typename TC::CompDataType>),
+                dim3(pre_blocks),
+                dim3(kPreThreads),
+                0,
+                stream,
+                reinterpret_cast<const InOutDataType*>(param.o_ptr),
+                reinterpret_cast<const InOutDataType*>(param.do_ptr),
+                reinterpret_cast<typename TC::CompDataType*>(param.d_ptr),
+                param.is_jagged,
+                reinterpret_cast<const int32_t*>(
+                    param.is_jagged ? param.seq_q_offsets_ptr : nullptr),
+                param.num_batch,
+                param.num_head,
+                grid_seqlen,
+                param.hdim_v,
+                // PRE reads O and dO with the SAME (O) strides: the harness allocates dO
+                // with a layout identical to O (both [batch, sq, head, hdim_v]), so this is
+                // always valid here. If dO ever gets a distinct layout (e.g. cross-attn /
+                // external dO), pass param.{seq,nhead,batch}_stride_do separately for dO.
+                static_cast<ck_tile::long_index_t>(param.seq_stride_o),
+                static_cast<ck_tile::long_index_t>(param.nhead_stride_o),
+                static_cast<ck_tile::long_index_t>(param.batch_stride_o),
+                static_cast<ck_tile::long_index_t>(param.nhead_stride_lsed),
+                static_cast<ck_tile::long_index_t>(param.batch_stride_lsed));
+        }
+
+        auto kargs = Kernel::MakeKargs(param.q_ptr,
+                                       param.k_ptr,
+                                       param.v_ptr,
+                                       param.do_ptr,
+                                       param.lse_ptr,
+                                       param.d_ptr,
+                                       param.dk_ptr,
+                                       param.dv_ptr,
+                                       param.dq_acc_ptr,
+                                       param.is_jagged,
+                                       param.seq_q_offsets_ptr,
+                                       param.is_cross_attention ? param.seq_kv_offsets_ptr
+                                                                : param.seq_q_offsets_ptr,
+                                       param.seqlen_q,
+                                       param.seqlen_kv,
+                                       param.hdim_qk,
+                                       param.hdim_v,
+                                       param.nhead_ratio_qk,
+                                       param.alpha,
+                                       param.num_targets_ptr,
+                                       param.contextual_seqlen,
+                                       param.window_size,
+                                       param.min_full_attn_seqlen,
+                                       param.seq_stride_q,
+                                       param.seq_stride_k,
+                                       param.seq_stride_v,
+                                       param.seq_stride_do,
+                                       param.seq_stride_dk,
+                                       param.seq_stride_dv,
+                                       param.stride_dq_acc,
+                                       param.nhead_stride_q,
+                                       param.nhead_stride_k,
+                                       param.nhead_stride_v,
+                                       param.nhead_stride_do,
+                                       param.nhead_stride_dk,
+                                       param.nhead_stride_dv,
+                                       param.nhead_stride_dq_acc,
+                                       param.nhead_stride_lsed,
+                                       param.batch_stride_q,
+                                       param.batch_stride_k,
+                                       param.batch_stride_v,
+                                       param.batch_stride_do,
+                                       param.batch_stride_dk,
+                                       param.batch_stride_dv,
+                                       param.batch_stride_dq_acc,
+                                       param.batch_stride_lsed);
+
+        const size_t dq_acc_elems =
+            param.is_jagged
+                ? static_cast<size_t>(param.batch_stride_dq_acc)
+                : static_cast<size_t>(param.num_batch) *
+                      static_cast<size_t>(param.batch_stride_dq_acc);
+        HIP_CHECK_ERROR(hipMemsetAsync(
+            param.dq_acc_ptr, 0, dq_acc_elems * sizeof(typename TC::GemmAccDataType), stream));
+
+        const ck_tile::index_t grid_seqlen_kv =
+            param.is_jagged ? param.max_seqlen_q : param.seqlen_kv;
+        dim3 grid = Kernel::GridSize(param.num_batch, param.num_head, grid_seqlen_kv);
+        dim3 block = Kernel::BlockSize();
+        constexpr ck_tile::index_t kBlockPerCu = Kernel::kBlockPerCu;
+
+        (void)ck_tile::launch_kernel(
+            ck_tile::stream_config{stream, false},
+            ck_tile::make_kernel<kBlockPerCu>(Kernel{}, grid, block, 0, kargs));
+
+        const ck_tile::long_index_t n = static_cast<ck_tile::long_index_t>(dq_acc_elems);
+        constexpr int kPostThreads = 256;
+        const int post_blocks      = static_cast<int>((n + kPostThreads - 1) / kPostThreads);
+        hipLaunchKernelGGL(
+            (ck_tile::hstu_bwd_convert_dq_kernel<InOutDataType, typename TC::GemmAccDataType>),
+            dim3(post_blocks),
+            dim3(kPostThreads),
+            0,
+            stream,
+            reinterpret_cast<const typename TC::GemmAccDataType*>(param.dq_acc_ptr),
+            reinterpret_cast<InOutDataType*>(param.dq_ptr),
+            n);
+    }
+
     static void Run(HstuAttentionNoGroupBwdParams& param, hipStream_t stream)
     {
-        // M3: jagged (variable-length) is handled by the same SiLU MAIN kernel — only
-        // the per-batch base offset / seqlen differ (selected at runtime by
-        // param.is_jagged inside the kernel + MakeKargs above). No separate instance.
+        // M3: jagged (variable-length) is handled by the same MAIN kernel — only the
+        // per-batch base offset / seqlen differ (runtime via param.is_jagged). M5 adds
+        // the softmax branch (PRE D + LSE/D loads); SiLU path is unchanged.
 
         if constexpr(kIsDeterministic)
         {
@@ -218,7 +383,16 @@ struct batched_backward_dispatch
         }
         else if constexpr(kUseSoftmax)
         {
-            throw std::runtime_error("HSTU bwd: softmax path not implemented yet (M5)");
+            // M5: softmax (no_group = batched + jagged). hdim64 only.
+            if(param.hdim_qk != 64 || param.hdim_v != 64)
+                throw std::runtime_error("HSTU bwd M5 softmax supports hdim_qk=hdim_v=64 only (M7)");
+
+            const bool use_local = (param.window_size > 0);
+            BOOL_SWITCH(use_local, kUseLocal, [&] {
+                using Mask = typename ck_tile::
+                    HstuBlockMasking<false /*cross*/, kUseCausal, kUseLocal>::Type;
+                RunSoftmax<Mask>(param, stream);
+            });
         }
         else
         {
