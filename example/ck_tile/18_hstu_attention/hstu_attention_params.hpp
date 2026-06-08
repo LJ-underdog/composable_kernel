@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include <ck_tile/core.hpp>
+#include <ck_tile/core/numeric/integer.hpp>
 
 struct HstuAttentionNoGroupFwdParams
 {
@@ -13,6 +13,10 @@ struct HstuAttentionNoGroupFwdParams
     bool is_cross_attention;
 
     bool is_jagged;
+
+    bool use_softmax;
+
+    bool is_training;
 
     ck_tile::index_t num_batch;
     ck_tile::index_t seqlen_q;      // batched mode only
@@ -26,6 +30,7 @@ struct HstuAttentionNoGroupFwdParams
     const void* v_ptr;
     const void* bias_ptr;
     void* o_ptr;
+    void* lse_ptr; // only used when both is_training and use_softmax be true
 
     ck_tile::index_t hdim_qk;
     ck_tile::index_t hdim_v;
@@ -38,12 +43,14 @@ struct HstuAttentionNoGroupFwdParams
     ck_tile::index_t seq_stride_v;
     ck_tile::index_t seq_stride_bias;
     ck_tile::index_t seq_stride_o;
+    ck_tile::index_t seq_stride_lse; // not needed if lse layout is [nhead, seqlen_q]
 
     ck_tile::index_t nhead_stride_q;
     ck_tile::index_t nhead_stride_k;
     ck_tile::index_t nhead_stride_v;
     ck_tile::index_t nhead_stride_bias;
     ck_tile::index_t nhead_stride_o;
+    ck_tile::index_t nhead_stride_lse; // not needed if lse layout is [seqlen_q, nhead]
 
     // batched mode only parameters
     ck_tile::index_t batch_stride_q;
@@ -51,6 +58,7 @@ struct HstuAttentionNoGroupFwdParams
     ck_tile::index_t batch_stride_v;
     ck_tile::index_t batch_stride_bias;
     ck_tile::index_t batch_stride_o;
+    ck_tile::index_t batch_stride_lse;
 
     const void* num_targets_ptr;
 
@@ -60,19 +68,9 @@ struct HstuAttentionNoGroupFwdParams
     ck_tile::index_t contextual_seqlen;
     ck_tile::index_t min_full_attn_seqlen;
 
-    bool use_softmax;
-
     float p_drop;
     uint64_t philox_seed;
     uint64_t philox_offset;
-
-    // this need not be set by the API users, we only use it for passing num_splits between splitkv
-    // and combine kernel
-    int num_splits;
-    // pointer of device memory allocated before calling fwd_splitkv kernel and released after
-    // calling combine kernel
-    void* o_acc_ptr;
-    void* lse_acc_ptr;
 };
 
 struct HstuAttentionGroupFwdParams
@@ -80,6 +78,10 @@ struct HstuAttentionGroupFwdParams
     // for self-attention (is_cross_attention = false), we requires
     // 1) either seq_kv_offsets_ptr == nullptr, or seq_kv_offsets_ptr == seq_q_offsets_ptr
     bool is_cross_attention;
+
+    bool use_softmax;
+
+    bool is_training;
 
     ck_tile::index_t num_group;
     ck_tile::index_t num_batch;
@@ -92,6 +94,7 @@ struct HstuAttentionGroupFwdParams
     const void* v_ptr;
     const void* bias_ptr;
     void* o_ptr;
+    void* lse_ptr; // only used when both is_training and use_softmax be true
 
     ck_tile::index_t hdim_qk;
     ck_tile::index_t hdim_v;
@@ -103,19 +106,14 @@ struct HstuAttentionGroupFwdParams
     ck_tile::index_t seq_stride_v;
     ck_tile::index_t seq_stride_bias;
     ck_tile::index_t seq_stride_o;
+    ck_tile::index_t seq_stride_lse; // not needed if lse layout is [nhead, seqlen_q]
 
     ck_tile::index_t nhead_stride_q;
     ck_tile::index_t nhead_stride_k;
     ck_tile::index_t nhead_stride_v;
     ck_tile::index_t nhead_stride_bias;
     ck_tile::index_t nhead_stride_o;
-
-    // batched mode only parameters
-    ck_tile::index_t batch_stride_q;
-    ck_tile::index_t batch_stride_k;
-    ck_tile::index_t batch_stride_v;
-    ck_tile::index_t batch_stride_bias;
-    ck_tile::index_t batch_stride_o;
+    ck_tile::index_t nhead_stride_lse; // not needed if lse layout is [seqlen_q, nhead]
 
     const void* num_targets_ptr;
 
@@ -128,17 +126,7 @@ struct HstuAttentionGroupFwdParams
     const void* group_contextual_seqlen_ptr;
     const void* group_min_full_attn_seqlen_ptr;
 
-    bool use_softmax;
-
     float p_drop;
     uint64_t philox_seed;
     uint64_t philox_offset;
-
-    // this need not be set by the API users, it only use it for passing num_splits between splitkv
-    // and combine kernel
-    int num_splits;
-    // pointer of device memory allocated before calling fwd_splitkv kernel and released after
-    // calling combine kernel
-    void* o_acc_ptr;
-    void* lse_acc_ptr;
 };

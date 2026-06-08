@@ -23,6 +23,7 @@ HSTU_COPYRIGHT_HEADER = """
 HSTU_FORWARD_INSTANCE_TEMPLATE_INC = """
 #include <ck_tile/core/numeric/{dtype_file}.hpp>
 #include \"hstu_attention_{mode}_forward_dispatch.hpp\"
+#include \"hstu_attention_params.hpp\"
 """
 
 HSTU_FORWARD_INSTANCE_TEMPLATE = """
@@ -30,6 +31,7 @@ HSTU_FORWARD_INSTANCE_TEMPLATE = """
     {dtype},
     {has_causal},
     {use_softmax},
+    {store_lse},
     {has_bias},
     {has_dropout},
     {max_k}>(HstuAttention{group_or_not}FwdParams& param, hipStream_t stream);
@@ -37,7 +39,7 @@ HSTU_FORWARD_INSTANCE_TEMPLATE = """
 
 HSTU_FORWARD_INSTANCE_FNAME = (
     "hstu_attention_{mode}_forward_{dtype_str}_{has_or_no_causal_str}_{use_softmax_or_not_str}_"
-    "{has_or_no_bias_str}_{has_or_no_dropout_str}_{max_k_str}.cpp"
+    "{store_lse_or_not_str}_{has_or_no_bias_str}_{has_or_no_dropout_str}_{max_k_str}.cpp"
 )
 
 HSTU_INSTANCE_REF_FNAME = "hstu_attention_{mode}_{function}_{dtype}_instances_ref.hpp"
@@ -52,6 +54,11 @@ BOOL_MAP_CAUSAL = {
 BOOL_MAP_SOFTMAX = {
     True: "softmax_true",
     False: "softmax_false",
+}
+
+BOOL_MAP_LSE = {
+    True: "lse_true",
+    False: "lse_false",
 }
 
 BOOL_MAP_BIAS = {
@@ -72,8 +79,8 @@ TYPE_CTYPE_MAP = {
 }
 
 TYPE_FNAME_MAP = {
-    "fp16": "bfloat16",
-    "bf16": "half",
+    "fp16": "half",
+    "bf16": "bfloat16",
 }
 
 MODE_GROUP_OR_NOT_MAP = {
@@ -87,7 +94,11 @@ def create_forward_instances(instance_dir: Path, headdims: List) -> None:
     for mode in ["batched", "jagged", "group"]:
         for dtype in ["fp16", "bf16"]:
             for has_causal in [True, False]:
-                for use_softmax in [True, False]:
+                for use_softmax, store_lse in [
+                    (True, False),
+                    (True, True),
+                    (False, False),
+                ]:
                     for has_bias in [True, False]:
                         for has_dropout in [False]:
                             for max_k in headdims:
@@ -98,6 +109,7 @@ def create_forward_instances(instance_dir: Path, headdims: List) -> None:
                                     use_softmax_or_not_str=BOOL_MAP_SOFTMAX[
                                         use_softmax
                                     ],
+                                    store_lse_or_not_str=BOOL_MAP_LSE[store_lse],
                                     has_or_no_bias_str=BOOL_MAP_BIAS[has_bias],
                                     has_or_no_dropout_str=BOOL_MAP_DROPOUT[has_dropout],
                                     max_k_str=INT_MAP_MAX_K[max_k],
@@ -115,6 +127,7 @@ def create_forward_instances(instance_dir: Path, headdims: List) -> None:
                                         dtype=TYPE_CTYPE_MAP[dtype],
                                         has_causal=BOOL_MAP[has_causal],
                                         use_softmax=BOOL_MAP[use_softmax],
+                                        store_lse=BOOL_MAP[store_lse],
                                         has_bias=BOOL_MAP[has_bias],
                                         has_dropout=BOOL_MAP[has_dropout],
                                         max_k=max_k,
@@ -256,7 +269,11 @@ def create_forward_instances_ref(instance_dir: Path, headdims: List) -> None:
                     for has_bias in [True, False]:
                         for has_dropout in [False]:
                             for has_causal in [True, False]:
-                                for use_softmax in [True, False]:
+                                for use_softmax, store_lse in [
+                                    (True, False),
+                                    (True, True),
+                                    (False, False),
+                                ]:
                                     forward_instance = (
                                         HSTU_FORWARD_INSTANCE_TEMPLATE.format(
                                             extern="extern ",
@@ -264,6 +281,7 @@ def create_forward_instances_ref(instance_dir: Path, headdims: List) -> None:
                                             dtype=TYPE_CTYPE_MAP[dtype],
                                             has_causal=BOOL_MAP[has_causal],
                                             use_softmax=BOOL_MAP[use_softmax],
+                                            store_lse=BOOL_MAP[store_lse],
                                             has_bias=BOOL_MAP[has_bias],
                                             has_dropout=BOOL_MAP[has_dropout],
                                             max_k=max_k,

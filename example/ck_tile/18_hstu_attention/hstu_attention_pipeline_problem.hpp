@@ -3,7 +3,10 @@
 
 #pragma once
 
-#include <ck_tile/core.hpp>
+#include <type_traits>
+
+#include <ck_tile/core/config.hpp>
+#include <ck_tile/core/numeric/integer.hpp>
 
 namespace ck_tile {
 
@@ -81,7 +84,6 @@ struct HstuAttentionFwdPipelineProblem
     using CompDataType = remove_cvref_t<CompDataType_>;
     using BiasDataType = remove_cvref_t<BiasDataType_>;
 
-    // to be compatible with ck_tile existing policy codes
     using OaccDataType = GemmAccDataType;
     using PDataType    = QKVDataType;
 
@@ -96,6 +98,8 @@ struct HstuAttentionFwdPipelineProblem
 
     static_assert(!kUseGroup || (kUseGroup && kIsJagged),
                   "Group HSTU is only used with jagged mode!");
+    static_assert(!kStoreLSE || (kStoreLSE && kUseSoftmax),
+                  "Storing Lse is only necessary when softmax is used!");
 
     using HstuAttentionTileSetting = remove_cvref_t<AttentionTileSetting_>;
 

@@ -27,6 +27,7 @@
 template <typename InOutDataType,
           bool kUseCausal,
           bool kUseSoftmax,
+          bool kStoreLSE,
           bool kHasBias,
           bool kHasDropout,
           ck_tile::index_t MaxK,
@@ -57,7 +58,7 @@ struct group_forward_causal_softmax_bias_dropout_dispatch
         kHasDropout,
         kUseCausal,
         kUseSoftmax,
-        false, // kStoreLSE
+        kStoreLSE,
         HstuAttentionTileSetting>;
 
     static void Run(HstuAttentionGroupFwdParams& param, hipStream_t stream)
@@ -129,6 +130,7 @@ struct group_forward_causal_softmax_bias_dropout_dispatch
                                          param.v_ptr,
                                          param.bias_ptr,
                                          param.o_ptr,
+                                         param.lse_ptr,
                                          param.num_batch / param.num_group,
                                          param.seq_q_offsets_ptr,
                                          param.is_cross_attention ? param.seq_kv_offsets_ptr
@@ -147,11 +149,13 @@ struct group_forward_causal_softmax_bias_dropout_dispatch
                                          param.seq_stride_v,
                                          param.seq_stride_bias,
                                          param.seq_stride_o,
+                                         param.seq_stride_lse,
                                          param.nhead_stride_q,
                                          param.nhead_stride_k,
                                          param.nhead_stride_v,
                                          param.nhead_stride_bias,
                                          param.nhead_stride_o,
+                                         param.nhead_stride_lse,
                                          param.num_targets_ptr,
                                          param.p_drop,
                                          param.philox_seed,
@@ -172,6 +176,7 @@ struct group_forward_causal_softmax_bias_dropout_dispatch
 template <typename InOutDataType,
           bool kUseCausal,
           bool kUseSoftmax,
+          bool kStoreLSE,
           bool kHasBias,
           bool kHasDropout,
           ck_tile::index_t MaxK>
@@ -182,6 +187,7 @@ void run_group_forward_causal_softmax_bias_dropout_dispatch(HstuAttentionGroupFw
         group_forward_causal_softmax_bias_dropout_dispatch<InOutDataType,
                                                            kUseCausal,
                                                            kUseSoftmax,
+                                                           kStoreLSE,
                                                            kHasBias,
                                                            kHasDropout,
                                                            MaxK,
@@ -201,6 +207,7 @@ void run_group_forward_causal_softmax_bias_dropout_dispatch(HstuAttentionGroupFw
             group_forward_splitkv_causal_softmax_bias_dropout_dispatch<InOutDataType,
                                                                        kUseCausal,
                                                                        kUseSoftmax,
+                                                                       kStoreLSE,
                                                                        kHasBias,
                                                                        kHasDropout,
                                                                        MaxK,
@@ -210,6 +217,7 @@ void run_group_forward_causal_softmax_bias_dropout_dispatch(HstuAttentionGroupFw
             group_forward_causal_softmax_bias_dropout_dispatch<InOutDataType,
                                                                kUseCausal,
                                                                kUseSoftmax,
+                                                               kStoreLSE,
                                                                kHasBias,
                                                                kHasDropout,
                                                                MaxK,
