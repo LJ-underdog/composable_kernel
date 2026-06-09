@@ -20,13 +20,14 @@ void hstu_attention_no_group_backward_bf16(HstuAttentionNoGroupBwdParams& param,
 {
     const bool use_causal = param.use_causal;
 
-    BOOL_SWITCH_2(use_causal, kUseCausal, param.use_softmax, kUseSoftmax, [&] {
-        // M0: bias / deterministic fixed false; MaxK fixed 64 (DESIGN §4.5 MVP).
+    // M6: kIsDeterministic is now a runtime-selected template axis (causal × softmax × determ).
+    BOOL_SWITCH_3(use_causal, kUseCausal, param.use_softmax, kUseSoftmax,
+                  param.kIsDeterministic, kIsDeterministic, [&] {
         run_batched_backward_dispatch<ck_tile::bf16_t,
                                       kUseCausal,
                                       kUseSoftmax,
                                       false, // kHasBias
-                                      false, // kIsDeterministic
+                                      kIsDeterministic,
                                       64>    // MaxK
             (param, stream);
     });

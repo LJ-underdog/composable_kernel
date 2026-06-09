@@ -180,7 +180,7 @@ def create_backward_instances(instance_dir: Path) -> None:
             for has_causal in [True, False]:
                 for use_softmax in [True, False]:
                     for has_bias in [False]:
-                        for is_deterministic in [False]:
+                        for is_deterministic in [False, True]:
                             for max_k in BWD_HEADDIMS_M0:
                                 fname = HSTU_BACKWARD_INSTANCE_FNAME.format(
                                     mode=mode,
@@ -231,7 +231,7 @@ def create_backward_instances_ref(instance_dir: Path) -> None:
                 file.write(inc)
                 for max_k in BWD_HEADDIMS_M0:
                     for has_bias in [False]:
-                        for is_deterministic in [False]:
+                        for is_deterministic in [False, True]:
                             for has_causal in [True, False]:
                                 for use_softmax in [True, False]:
                                     file.write(
