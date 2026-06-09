@@ -40,3 +40,35 @@ extern template void run_batched_backward_dispatch<
     false,
     false,
     64>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_dispatch<
+    ck_tile::bf16_t,
+    true,
+    true,
+    false,
+    true,
+    64>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_dispatch<
+    ck_tile::bf16_t,
+    true,
+    false,
+    false,
+    true,
+    64>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_dispatch<
+    ck_tile::bf16_t,
+    false,
+    true,
+    false,
+    true,
+    64>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_dispatch<
+    ck_tile::bf16_t,
+    false,
+    false,
+    false,
+    true,
+    64>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);

@@ -64,6 +64,74 @@ struct batched_backward_dispatch
 
     using TC = HstuAttentionFwdTypeConfig<InOutDataType>;
 
+    // Shared tail for both SiLU and softmax MAIN: zero dq_acc, launch MAIN, then POST.
+    // Atomic (kIsDeterministic=false): single dq_acc slot -> convert. Deterministic: dq_acc
+    // is num_splits stacked slots (each KV-block wrote its own via set) -> reduce-then-convert.
+    template <typename Pipeline, typename Kernel, typename Kargs>
+    static void
+    launch_main_and_post(HstuAttentionNoGroupBwdParams& param, hipStream_t stream, Kargs& kargs)
+    {
+        // single-slot element count (== atomic dq_acc size; == split_stride in determ)
+        const size_t single =
+            param.is_jagged
+                ? static_cast<size_t>(param.batch_stride_dq_acc)
+                : static_cast<size_t>(param.num_batch) *
+                      static_cast<size_t>(param.batch_stride_dq_acc);
+
+        // grid.x covers the largest seqlen_kv; split_idx = i_tile_n -> num_splits = grid.x
+        const ck_tile::index_t grid_seqlen_kv =
+            param.is_jagged ? param.max_seqlen_q : param.seqlen_kv;
+        const int num_splits =
+            kIsDeterministic
+                ? static_cast<int>(ck_tile::integer_divide_ceil(grid_seqlen_kv, Pipeline::kN0))
+                : 1;
+
+        HIP_CHECK_ERROR(hipMemsetAsync(param.dq_acc_ptr,
+                                       0,
+                                       single * static_cast<size_t>(num_splits) *
+                                           sizeof(typename TC::GemmAccDataType),
+                                       stream));
+
+        dim3 grid  = Kernel::GridSize(param.num_batch, param.num_head, grid_seqlen_kv);
+        dim3 block = Kernel::BlockSize();
+        constexpr ck_tile::index_t kBlockPerCu = Kernel::kBlockPerCu;
+        (void)ck_tile::launch_kernel(
+            ck_tile::stream_config{stream, false},
+            ck_tile::make_kernel<kBlockPerCu>(Kernel{}, grid, block, 0, kargs));
+
+        // POST: dq_acc(float) -> dq. Determ reduces over splits (fixed order -> reproducible).
+        const ck_tile::long_index_t n = static_cast<ck_tile::long_index_t>(single);
+        constexpr int kPostThreads = 256;
+        const int post_blocks      = static_cast<int>((n + kPostThreads - 1) / kPostThreads);
+        if constexpr(kIsDeterministic)
+        {
+            hipLaunchKernelGGL(
+                (ck_tile::hstu_bwd_reduce_convert_dq_kernel<InOutDataType,
+                                                            typename TC::GemmAccDataType>),
+                dim3(post_blocks),
+                dim3(kPostThreads),
+                0,
+                stream,
+                reinterpret_cast<const typename TC::GemmAccDataType*>(param.dq_acc_ptr),
+                reinterpret_cast<InOutDataType*>(param.dq_ptr),
+                n,
+                num_splits,
+                static_cast<ck_tile::long_index_t>(single));
+        }
+        else
+        {
+            hipLaunchKernelGGL(
+                (ck_tile::hstu_bwd_convert_dq_kernel<InOutDataType, typename TC::GemmAccDataType>),
+                dim3(post_blocks),
+                dim3(kPostThreads),
+                0,
+                stream,
+                reinterpret_cast<const typename TC::GemmAccDataType*>(param.dq_acc_ptr),
+                reinterpret_cast<InOutDataType*>(param.dq_ptr),
+                n);
+        }
+    }
+
     template <typename Mask>
     static void RunSilu(HstuAttentionNoGroupBwdParams& param, hipStream_t stream)
     {
@@ -99,7 +167,7 @@ struct batched_backward_dispatch
             typename TC::BiasDataType,      // BiasGradDataType (dummy)
             FmhaBwdShape,
             false, // kIsGroupMode
-            false, // kIsDeterministic (M1 atomic)
+            kIsDeterministic, // M6: deterministic (set+split) vs atomic (false)
             Mask,
             Dropout,
             false, // kUseTrLoad (M1 non-trload; trload perf is M8)
@@ -167,44 +235,10 @@ struct batched_backward_dispatch
                                        param.batch_stride_do,
                                        param.batch_stride_dk,
                                        param.batch_stride_dv,
-                                       param.batch_stride_dq_acc);
+                                       param.batch_stride_dq_acc,
+                                       param.split_stride_dq_acc);
 
-        // zero the float dq_acc workspace before atomic accumulation. Batched layout
-        // is [num_batch, sq, h, hdim]; jagged is the dim0=1 packed [1, ΣL, h, hdim]
-        // whose dim0 stride (batch_stride_dq_acc) is the full element count.
-        const size_t dq_acc_elems =
-            param.is_jagged
-                ? static_cast<size_t>(param.batch_stride_dq_acc)
-                : static_cast<size_t>(param.num_batch) *
-                      static_cast<size_t>(param.batch_stride_dq_acc);
-        HIP_CHECK_ERROR(hipMemsetAsync(
-            param.dq_acc_ptr, 0, dq_acc_elems * sizeof(typename TC::GemmAccDataType), stream));
-
-        // jagged: grid.x must cover the largest per-batch seqlen_kv (== max_seqlen_q
-        // for self-attention); KV tiles past a given batch's length early-exit.
-        const ck_tile::index_t grid_seqlen_kv =
-            param.is_jagged ? param.max_seqlen_q : param.seqlen_kv;
-        dim3 grid = Kernel::GridSize(param.num_batch, param.num_head, grid_seqlen_kv);
-        dim3 block = Kernel::BlockSize();
-        constexpr ck_tile::index_t kBlockPerCu = Kernel::kBlockPerCu;
-
-        (void)ck_tile::launch_kernel(
-            ck_tile::stream_config{stream, false},
-            ck_tile::make_kernel<kBlockPerCu>(Kernel{}, grid, block, 0, kargs));
-
-        // POST: convert dq_acc(float) -> dq(InOutDataType) elementwise (atomic path, nsplits=1)
-        const ck_tile::long_index_t n = static_cast<ck_tile::long_index_t>(dq_acc_elems);
-        constexpr int kPostThreads = 256;
-        const int post_blocks      = static_cast<int>((n + kPostThreads - 1) / kPostThreads);
-        hipLaunchKernelGGL(
-            (ck_tile::hstu_bwd_convert_dq_kernel<InOutDataType, typename TC::GemmAccDataType>),
-            dim3(post_blocks),
-            dim3(kPostThreads),
-            0,
-            stream,
-            reinterpret_cast<const typename TC::GemmAccDataType*>(param.dq_acc_ptr),
-            reinterpret_cast<InOutDataType*>(param.dq_ptr),
-            n);
+        launch_main_and_post<Pipeline, Kernel>(param, stream, kargs);
     }
 
     // M5 softmax path (no_group = batched + jagged). PRE (D=rowsum(O*dO)) -> memset
@@ -241,7 +275,7 @@ struct batched_backward_dispatch
             typename TC::BiasDataType,
             FmhaBwdShape,
             false, // kIsGroupMode
-            false, // kIsDeterministic
+            kIsDeterministic, // M6: deterministic (set+split) vs atomic (false)
             Mask,
             Dropout,
             false, // kUseTrLoad
@@ -337,51 +371,20 @@ struct batched_backward_dispatch
                                        param.batch_stride_dk,
                                        param.batch_stride_dv,
                                        param.batch_stride_dq_acc,
-                                       param.batch_stride_lsed);
+                                       param.batch_stride_lsed,
+                                       param.split_stride_dq_acc);
 
-        const size_t dq_acc_elems =
-            param.is_jagged
-                ? static_cast<size_t>(param.batch_stride_dq_acc)
-                : static_cast<size_t>(param.num_batch) *
-                      static_cast<size_t>(param.batch_stride_dq_acc);
-        HIP_CHECK_ERROR(hipMemsetAsync(
-            param.dq_acc_ptr, 0, dq_acc_elems * sizeof(typename TC::GemmAccDataType), stream));
-
-        const ck_tile::index_t grid_seqlen_kv =
-            param.is_jagged ? param.max_seqlen_q : param.seqlen_kv;
-        dim3 grid = Kernel::GridSize(param.num_batch, param.num_head, grid_seqlen_kv);
-        dim3 block = Kernel::BlockSize();
-        constexpr ck_tile::index_t kBlockPerCu = Kernel::kBlockPerCu;
-
-        (void)ck_tile::launch_kernel(
-            ck_tile::stream_config{stream, false},
-            ck_tile::make_kernel<kBlockPerCu>(Kernel{}, grid, block, 0, kargs));
-
-        const ck_tile::long_index_t n = static_cast<ck_tile::long_index_t>(dq_acc_elems);
-        constexpr int kPostThreads = 256;
-        const int post_blocks      = static_cast<int>((n + kPostThreads - 1) / kPostThreads);
-        hipLaunchKernelGGL(
-            (ck_tile::hstu_bwd_convert_dq_kernel<InOutDataType, typename TC::GemmAccDataType>),
-            dim3(post_blocks),
-            dim3(kPostThreads),
-            0,
-            stream,
-            reinterpret_cast<const typename TC::GemmAccDataType*>(param.dq_acc_ptr),
-            reinterpret_cast<InOutDataType*>(param.dq_ptr),
-            n);
+        launch_main_and_post<Pipeline, Kernel>(param, stream, kargs);
     }
 
     static void Run(HstuAttentionNoGroupBwdParams& param, hipStream_t stream)
     {
-        // M3: jagged (variable-length) is handled by the same MAIN kernel — only the
-        // per-batch base offset / seqlen differ (runtime via param.is_jagged). M5 adds
-        // the softmax branch (PRE D + LSE/D loads); SiLU path is unchanged.
+        // M3: jagged handled by the same MAIN kernel (runtime param.is_jagged). M5 adds the
+        // softmax branch (PRE D + LSE/D). M6: kIsDeterministic is a template axis threaded
+        // into the pipeline/kernel (set+split dq_acc + POST reduce) — no separate branch here;
+        // both SiLU and softmax paths support atomic & deterministic.
 
-        if constexpr(kIsDeterministic)
-        {
-            throw std::runtime_error("HSTU bwd: deterministic path not implemented yet (M6)");
-        }
-        else if constexpr(kUseSoftmax)
+        if constexpr(kUseSoftmax)
         {
             // M5: softmax (no_group = batched + jagged). hdim64 only.
             if(param.hdim_qk != 64 || param.hdim_v != 64)

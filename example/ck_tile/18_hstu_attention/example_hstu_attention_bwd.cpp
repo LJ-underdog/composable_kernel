@@ -294,9 +294,17 @@ bool run_no_group_hstu_bwd(const ck_tile::ArgParser& arg_parser)
     // jagged cu_seqlens offsets (size num_batch+1); allocate >=1 elem so batched is benign
     ck_tile::DeviceMem seq_offsets_q_dev(std::max<size_t>(seq_offsets_q.size(), 1) * sizeof(int));
 
-    // float dQ accumulation workspace (atomic path, nsplits=1; same packed layout as dQ)
-    const size_t dq_acc_elems =
+    // float dQ accumulation workspace. atomic: 1 slot (same packed layout as dQ). M6
+    // deterministic: num_splits stacked slots (one per KV-block) -> POST reduces over them.
+    // num_splits = ceil(grid_seqlen_kv / kN0); kN0=128 (hd64 bwd preset, matches dispatch).
+    const bool is_deterministic = static_cast<bool>(arg_parser.get_int("deterministic"));
+    constexpr int kN0_bwd       = 128;
+    const int grid_seqlen_kv_h  = is_jagged ? max_seqlen_q : phy_seqlen_kv;
+    const int num_splits =
+        is_deterministic ? ((grid_seqlen_kv_h + kN0_bwd - 1) / kN0_bwd) : 1;
+    const size_t single_dq_acc_elems =
         static_cast<size_t>(batches_for_alloc) * phy_seqlen_q * num_head * hdim_qk;
+    const size_t dq_acc_elems = single_dq_acc_elems * static_cast<size_t>(num_splits);
     ck_tile::DeviceMem dq_acc_dev(dq_acc_elems * sizeof(CompDataType));
 
     // LSE (fwd output) + D (PRE output), softmax path only. Layout [batch,head,seq]
@@ -467,9 +475,10 @@ bool run_no_group_hstu_bwd(const ck_tile::ArgParser& arg_parser)
         bp.stride_dq_acc       = dq_host.get_strides()[1]; // same layout as dQ
         bp.nhead_stride_dq_acc = dq_host.get_strides()[2];
         bp.batch_stride_dq_acc = dq_host.get_strides()[0];
-        bp.split_stride_dq_acc = 0;
-        bp.num_splits          = 1;
-        bp.kIsDeterministic    = static_cast<bool>(arg_parser.get_int("deterministic"));
+        // M6 deterministic: split slot stride = single-slot element count; num_splits stacks.
+        bp.split_stride_dq_acc = is_deterministic ? static_cast<ck_tile::index_t>(single_dq_acc_elems) : 0;
+        bp.num_splits          = num_splits;
+        bp.kIsDeterministic    = is_deterministic;
 
         if constexpr(std::is_same<InOutDataType, ck_tile::bf16_t>::value)
             hstu_attention_no_group_backward_bf16(bp, stream);

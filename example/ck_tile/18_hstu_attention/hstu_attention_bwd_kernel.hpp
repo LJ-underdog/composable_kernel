@@ -112,6 +112,7 @@ struct HstuAttentionBwdDQDKDVKernel
         index_t batch_stride_dk;
         index_t batch_stride_dv;
         index_t batch_stride_dq_acc;
+        index_t split_stride_dq_acc; // M6 deterministic: per-split slot stride (single-slot elems)
     };
 
     CK_TILE_HOST static constexpr Kargs MakeKargs(const void* q_ptr,
@@ -155,7 +156,8 @@ struct HstuAttentionBwdDQDKDVKernel
                                                   index_t batch_stride_do,
                                                   index_t batch_stride_dk,
                                                   index_t batch_stride_dv,
-                                                  index_t batch_stride_dq_acc)
+                                                  index_t batch_stride_dq_acc,
+                                                  index_t split_stride_dq_acc)
     {
         Kargs k;
         k.q_ptr               = q_ptr;
@@ -200,6 +202,7 @@ struct HstuAttentionBwdDQDKDVKernel
         k.batch_stride_dk     = batch_stride_dk;
         k.batch_stride_dv     = batch_stride_dv;
         k.batch_stride_dq_acc = batch_stride_dq_acc;
+        k.split_stride_dq_acc = split_stride_dq_acc;
         return k;
     }
 
@@ -354,24 +357,33 @@ struct HstuAttentionBwdDQDKDVKernel
             do_dram, make_tuple(number<HstuPipeline::kM0>{}, number<HstuPipeline::kVHeaddim>{}),
             {0, 0});
 
-        // dQ_acc atomic_add window (M1: atomic path, nsplits=1)
-        AccDataType* dq_acc_ptr =
-            reinterpret_cast<AccDataType*>(kargs.dq_acc_ptr) +
-            static_cast<long_index_t>(i_nhead) * kargs.nhead_stride_dq_acc + batch_offset_dq_acc;
-
-        auto dq_acc_dram = pad_tensor_view(
-            make_naive_tensor_view<address_space_enum::global, memory_operation_enum::atomic_add>(
-                dq_acc_ptr,
-                make_tuple(kargs.seqlen_q, kargs.hdim_qk),
-                make_tuple(kargs.stride_dq_acc, 1),
-                number<HstuPipeline::kAlignmentQGrad>{},
-                number<1>{}),
-            make_tuple(number<HstuPipeline::kM0>{}, number<HstuPipeline::kQKHeaddim>{}),
-            sequence<false, (kPadHeadDimQ > 0)>{});
-
-        auto dq_dram_window = make_tile_window(
-            dq_acc_dram, make_tuple(number<HstuPipeline::kM0>{}, number<HstuPipeline::kQKHeaddim>{}),
-            {0, 0});
+        // dQ_acc window. Deterministic (M6): plain store (set) into THIS KV-block's own
+        // split slot (base += i_tile_n * split_stride_dq_acc) -> no atomic, bit-reproducible;
+        // POST reduces over splits. Atomic (default, nsplits=1): atomic_add into one slot.
+        auto dq_dram_window = [&, i_tile_n_ = i_tile_n, i_nhead_ = i_nhead]() {
+            constexpr auto mop = kIsDeterministic ? memory_operation_enum::set
+                                                  : memory_operation_enum::atomic_add;
+            AccDataType* dq_acc_ptr =
+                reinterpret_cast<AccDataType*>(kargs.dq_acc_ptr) +
+                static_cast<long_index_t>(i_nhead_) * kargs.nhead_stride_dq_acc +
+                batch_offset_dq_acc;
+            if constexpr(kIsDeterministic)
+                dq_acc_ptr +=
+                    static_cast<long_index_t>(i_tile_n_) * kargs.split_stride_dq_acc;
+            auto dq_acc_dram = pad_tensor_view(
+                make_naive_tensor_view<address_space_enum::global, mop>(
+                    dq_acc_ptr,
+                    make_tuple(kargs.seqlen_q, kargs.hdim_qk),
+                    make_tuple(kargs.stride_dq_acc, 1),
+                    number<HstuPipeline::kAlignmentQGrad>{},
+                    number<1>{}),
+                make_tuple(number<HstuPipeline::kM0>{}, number<HstuPipeline::kQKHeaddim>{}),
+                sequence<false, (kPadHeadDimQ > 0)>{});
+            return make_tile_window(
+                dq_acc_dram,
+                make_tuple(number<HstuPipeline::kM0>{}, number<HstuPipeline::kQKHeaddim>{}),
+                {0, 0});
+        }();
 
         // Build the HSTU mask identically to fwd/reference (self-attention; M2 batched).
         // is_tile_in_first_split=true (conservative: disables the IsFullTileInsideMask
@@ -531,6 +543,7 @@ struct HstuAttentionBwdDQDKDVSoftmaxKernel
         index_t batch_stride_dv;
         index_t batch_stride_dq_acc;
         index_t batch_stride_lsed;
+        index_t split_stride_dq_acc; // M6 deterministic
     };
 
     CK_TILE_HOST static constexpr Kargs MakeKargs(const void* q_ptr,
@@ -577,7 +590,8 @@ struct HstuAttentionBwdDQDKDVSoftmaxKernel
                                                   index_t batch_stride_dk,
                                                   index_t batch_stride_dv,
                                                   index_t batch_stride_dq_acc,
-                                                  index_t batch_stride_lsed)
+                                                  index_t batch_stride_lsed,
+                                                  index_t split_stride_dq_acc)
     {
         Kargs k;
         k.q_ptr                = q_ptr;
@@ -625,6 +639,7 @@ struct HstuAttentionBwdDQDKDVSoftmaxKernel
         k.batch_stride_dv      = batch_stride_dv;
         k.batch_stride_dq_acc  = batch_stride_dq_acc;
         k.batch_stride_lsed    = batch_stride_lsed;
+        k.split_stride_dq_acc  = split_stride_dq_acc;
         return k;
     }
 
@@ -775,20 +790,29 @@ struct HstuAttentionBwdDQDKDVSoftmaxKernel
         auto d_dram_window =
             make_tile_window(d_dram, make_tuple(number<HstuPipeline::kM0>{}), {0});
 
-        AccDataType* dq_acc_ptr =
-            reinterpret_cast<AccDataType*>(kargs.dq_acc_ptr) +
-            static_cast<long_index_t>(i_nhead) * kargs.nhead_stride_dq_acc + batch_offset_dq_acc;
-
-        auto dq_acc_dram = pad_tensor_view(
-            make_naive_tensor_view<address_space_enum::global, memory_operation_enum::atomic_add>(
-                dq_acc_ptr, make_tuple(kargs.seqlen_q, kargs.hdim_qk),
-                make_tuple(kargs.stride_dq_acc, 1), number<HstuPipeline::kAlignmentQGrad>{},
-                number<1>{}),
-            make_tuple(number<HstuPipeline::kM0>{}, number<HstuPipeline::kQKHeaddim>{}),
-            sequence<false, (kPadHeadDimQ > 0)>{});
-        auto dq_dram_window = make_tile_window(
-            dq_acc_dram, make_tuple(number<HstuPipeline::kM0>{}, number<HstuPipeline::kQKHeaddim>{}),
-            {0, 0});
+        // dQ_acc window — deterministic (set + per-split slot) vs atomic (M6, see SiLU kernel).
+        auto dq_dram_window = [&, i_tile_n_ = i_tile_n, i_nhead_ = i_nhead]() {
+            constexpr auto mop = kIsDeterministic ? memory_operation_enum::set
+                                                  : memory_operation_enum::atomic_add;
+            AccDataType* dq_acc_ptr =
+                reinterpret_cast<AccDataType*>(kargs.dq_acc_ptr) +
+                static_cast<long_index_t>(i_nhead_) * kargs.nhead_stride_dq_acc +
+                batch_offset_dq_acc;
+            if constexpr(kIsDeterministic)
+                dq_acc_ptr +=
+                    static_cast<long_index_t>(i_tile_n_) * kargs.split_stride_dq_acc;
+            auto dq_acc_dram = pad_tensor_view(
+                make_naive_tensor_view<address_space_enum::global, mop>(
+                    dq_acc_ptr, make_tuple(kargs.seqlen_q, kargs.hdim_qk),
+                    make_tuple(kargs.stride_dq_acc, 1), number<HstuPipeline::kAlignmentQGrad>{},
+                    number<1>{}),
+                make_tuple(number<HstuPipeline::kM0>{}, number<HstuPipeline::kQKHeaddim>{}),
+                sequence<false, (kPadHeadDimQ > 0)>{});
+            return make_tile_window(
+                dq_acc_dram,
+                make_tuple(number<HstuPipeline::kM0>{}, number<HstuPipeline::kQKHeaddim>{}),
+                {0, 0});
+        }();
 
         const int num_target =
             (kargs.num_targets_ptr != nullptr)
@@ -1637,6 +1661,28 @@ __global__ void hstu_bwd_convert_dq_kernel(const AccDataType* __restrict__ dq_ac
         static_cast<long_index_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if(i < n)
         dq[i] = type_convert<QGradDataType>(dq_acc[i]);
+}
+
+// POST (deterministic path): reduce dQ over the per-KV-block split slots, then convert.
+// dq_acc holds num_splits stacked single-slot copies (stride = split_stride). The
+// summation order is fixed (s = 0..num_splits-1) regardless of block scheduling, so
+// the result is bit-reproducible. n = single-slot element count. Atomic path keeps the
+// plain convert above (num_splits=1).
+template <typename QGradDataType, typename AccDataType>
+__global__ void hstu_bwd_reduce_convert_dq_kernel(const AccDataType* __restrict__ dq_acc,
+                                                  QGradDataType* __restrict__ dq,
+                                                  long_index_t n,
+                                                  int num_splits,
+                                                  long_index_t split_stride)
+{
+    const long_index_t i =
+        static_cast<long_index_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if(i >= n)
+        return;
+    float acc = 0.f;
+    for(int s = 0; s < num_splits; ++s)
+        acc += type_convert<float>(dq_acc[static_cast<long_index_t>(s) * split_stride + i]);
+    dq[i] = type_convert<QGradDataType>(acc);
 }
 
 } // namespace ck_tile
