@@ -961,6 +961,7 @@ struct HstuAttentionBwdDQDKDVGroupKernel
         index_t nhead_stride_dk;
         index_t nhead_stride_dv;
         index_t nhead_stride_dq_acc;
+        index_t split_stride_dq_acc; // M6b deterministic
     };
 
     CK_TILE_HOST static constexpr Kargs MakeKargs(const void* q_ptr,
@@ -996,7 +997,8 @@ struct HstuAttentionBwdDQDKDVGroupKernel
                                                   index_t nhead_stride_do,
                                                   index_t nhead_stride_dk,
                                                   index_t nhead_stride_dv,
-                                                  index_t nhead_stride_dq_acc)
+                                                  index_t nhead_stride_dq_acc,
+                                                  index_t split_stride_dq_acc)
     {
         Kargs k;
         k.q_ptr                         = q_ptr;
@@ -1033,6 +1035,7 @@ struct HstuAttentionBwdDQDKDVGroupKernel
         k.nhead_stride_dk               = nhead_stride_dk;
         k.nhead_stride_dv               = nhead_stride_dv;
         k.nhead_stride_dq_acc           = nhead_stride_dq_acc;
+        k.split_stride_dq_acc           = split_stride_dq_acc;
         return k;
     }
 
@@ -1164,17 +1167,27 @@ struct HstuAttentionBwdDQDKDVGroupKernel
         auto do_dram_window = make_tile_window(
             do_dram, make_tuple(number<P::kM0>{}, number<P::kVHeaddim>{}), {0, 0});
 
-        AccDataType* dq_acc_ptr =
-            reinterpret_cast<AccDataType*>(kargs.dq_acc_ptr) +
-            static_cast<long_index_t>(i_nhead) * kargs.nhead_stride_dq_acc + batch_offset_dq_acc;
-        auto dq_acc_dram = pad_tensor_view(
-            make_naive_tensor_view<address_space_enum::global, memory_operation_enum::atomic_add>(
-                dq_acc_ptr, make_tuple(seqlen_q, kargs.hdim_qk),
-                make_tuple(kargs.stride_dq_acc, 1), number<P::kAlignmentQGrad>{}, number<1>{}),
-            make_tuple(number<P::kM0>{}, number<P::kQKHeaddim>{}),
-            sequence<false, (kPadHeadDimQ > 0)>{});
-        auto dq_dram_window = make_tile_window(
-            dq_acc_dram, make_tuple(number<P::kM0>{}, number<P::kQKHeaddim>{}), {0, 0});
+        // dQ_acc window — determ (set + per-split slot) vs atomic (M6b; see no_group kernel).
+        // group packed base = query_start*stride + i_nhead*nhead_stride; determ adds split slot.
+        auto dq_dram_window = [&, i_tile_n_ = i_tile_n]() {
+            constexpr auto mop = kIsDeterministic ? memory_operation_enum::set
+                                                  : memory_operation_enum::atomic_add;
+            AccDataType* dq_acc_ptr =
+                reinterpret_cast<AccDataType*>(kargs.dq_acc_ptr) +
+                static_cast<long_index_t>(i_nhead) * kargs.nhead_stride_dq_acc +
+                batch_offset_dq_acc;
+            if constexpr(kIsDeterministic)
+                dq_acc_ptr +=
+                    static_cast<long_index_t>(i_tile_n_) * kargs.split_stride_dq_acc;
+            auto dq_acc_dram = pad_tensor_view(
+                make_naive_tensor_view<address_space_enum::global, mop>(
+                    dq_acc_ptr, make_tuple(seqlen_q, kargs.hdim_qk),
+                    make_tuple(kargs.stride_dq_acc, 1), number<P::kAlignmentQGrad>{}, number<1>{}),
+                make_tuple(number<P::kM0>{}, number<P::kQKHeaddim>{}),
+                sequence<false, (kPadHeadDimQ > 0)>{});
+            return make_tile_window(
+                dq_acc_dram, make_tuple(number<P::kM0>{}, number<P::kQKHeaddim>{}), {0, 0});
+        }();
 
         // mask-independent dk/dv write-back (shared by both branches)
         auto write_dkdv = [&](auto& dk_acc_tile, auto& dv_acc_tile) {
@@ -1309,6 +1322,7 @@ struct HstuAttentionBwdDQDKDVGroupSoftmaxKernel
         index_t nhead_stride_dv;
         index_t nhead_stride_dq_acc;
         index_t nhead_stride_lsed; // LSE and D share this (== ΣL packed)
+        index_t split_stride_dq_acc; // M6b deterministic
     };
 
     CK_TILE_HOST static constexpr Kargs MakeKargs(const void* q_ptr,
@@ -1347,7 +1361,8 @@ struct HstuAttentionBwdDQDKDVGroupSoftmaxKernel
                                                   index_t nhead_stride_dk,
                                                   index_t nhead_stride_dv,
                                                   index_t nhead_stride_dq_acc,
-                                                  index_t nhead_stride_lsed)
+                                                  index_t nhead_stride_lsed,
+                                                  index_t split_stride_dq_acc)
     {
         Kargs k;
         k.q_ptr                          = q_ptr;
@@ -1387,6 +1402,7 @@ struct HstuAttentionBwdDQDKDVGroupSoftmaxKernel
         k.nhead_stride_dv                = nhead_stride_dv;
         k.nhead_stride_dq_acc            = nhead_stride_dq_acc;
         k.nhead_stride_lsed              = nhead_stride_lsed;
+        k.split_stride_dq_acc            = split_stride_dq_acc;
         return k;
     }
 
@@ -1523,17 +1539,27 @@ struct HstuAttentionBwdDQDKDVGroupSoftmaxKernel
         auto lse_dram_window = make_tile_window(lse_dram, make_tuple(number<P::kM0>{}), {0});
         auto d_dram_window   = make_tile_window(d_dram, make_tuple(number<P::kM0>{}), {0});
 
-        AccDataType* dq_acc_ptr =
-            reinterpret_cast<AccDataType*>(kargs.dq_acc_ptr) +
-            static_cast<long_index_t>(i_nhead) * kargs.nhead_stride_dq_acc + batch_offset_dq_acc;
-        auto dq_acc_dram = pad_tensor_view(
-            make_naive_tensor_view<address_space_enum::global, memory_operation_enum::atomic_add>(
-                dq_acc_ptr, make_tuple(seqlen_q, kargs.hdim_qk),
-                make_tuple(kargs.stride_dq_acc, 1), number<P::kAlignmentQGrad>{}, number<1>{}),
-            make_tuple(number<P::kM0>{}, number<P::kQKHeaddim>{}),
-            sequence<false, (kPadHeadDimQ > 0)>{});
-        auto dq_dram_window = make_tile_window(
-            dq_acc_dram, make_tuple(number<P::kM0>{}, number<P::kQKHeaddim>{}), {0, 0});
+        // dQ_acc window — determ (set + per-split slot) vs atomic (M6b; see no_group kernel).
+        // group packed base = query_start*stride + i_nhead*nhead_stride; determ adds split slot.
+        auto dq_dram_window = [&, i_tile_n_ = i_tile_n]() {
+            constexpr auto mop = kIsDeterministic ? memory_operation_enum::set
+                                                  : memory_operation_enum::atomic_add;
+            AccDataType* dq_acc_ptr =
+                reinterpret_cast<AccDataType*>(kargs.dq_acc_ptr) +
+                static_cast<long_index_t>(i_nhead) * kargs.nhead_stride_dq_acc +
+                batch_offset_dq_acc;
+            if constexpr(kIsDeterministic)
+                dq_acc_ptr +=
+                    static_cast<long_index_t>(i_tile_n_) * kargs.split_stride_dq_acc;
+            auto dq_acc_dram = pad_tensor_view(
+                make_naive_tensor_view<address_space_enum::global, mop>(
+                    dq_acc_ptr, make_tuple(seqlen_q, kargs.hdim_qk),
+                    make_tuple(kargs.stride_dq_acc, 1), number<P::kAlignmentQGrad>{}, number<1>{}),
+                make_tuple(number<P::kM0>{}, number<P::kQKHeaddim>{}),
+                sequence<false, (kPadHeadDimQ > 0)>{});
+            return make_tile_window(
+                dq_acc_dram, make_tuple(number<P::kM0>{}, number<P::kQKHeaddim>{}), {0, 0});
+        }();
 
         auto write_dkdv = [&](auto& dk_acc_tile, auto& dv_acc_tile) {
             auto dk_dram = pad_tensor_view(
@@ -1585,6 +1611,14 @@ struct HstuAttentionBwdDQDKDVGroupSoftmaxKernel
 };
 
 // PRE (softmax path): D[b,h,sq] = Σ_v O[b,sq,h,v] * dO[b,sq,h,v]  (DESIGN §1.1).
+//
+// PRECONDITION (M6b): the launch grid is bounded by `max_seqlen_q`; a thread whose sq is
+// >= its batch's seqlen returns, BUT tokens in [max_seqlen_q, seqlen_q) are never visited.
+// Therefore the caller MUST pass max_seqlen_q >= every batch's packed seqlen, otherwise the
+// tail tokens of the longest batch get NO D written (d_ptr is intentionally not memset — a
+// D=0 fallback would be deterministically-wrong, not correct) and dQ for those rows is wrong.
+// The harness enforces this with an assert; group_max_seqlens_q must be the true per-batch max.
+//
 // One thread per (i_batch, i_nhead, sq) row. O/dO are in their [batch,seq,head,hdim]
 // layout (jagged: [1,ΣL,head,hdim] via q offsets); D is written [batch,head,seq]
 // (seq-continuous, nhead_stride_lsed, batch_stride_lsed) — the exact layout the
