@@ -642,25 +642,34 @@ bool run_group_hstu_bwd(const ck_tile::ArgParser& arg_parser, int num_group)
     supplement_array_by_last_element(group_min_full_attn_seqlens, num_group);
     supplement_array_by_last_element(group_attn_scales, num_group);
 
-    // per-group max uih seqlen (max over the group's batches, or user override)
-    std::vector<int> group_max_uih_seqlens_q(num_group, 0);
-    for(int i_grp = 0; i_grp < num_group; i_grp++)
-    {
-        for(int i = 0; i < num_batch_per_group; i++)
-            group_max_uih_seqlens_q[i_grp] =
-                std::max(group_max_uih_seqlens_q[i_grp], seq_lengths_q[i_grp * num_batch_per_group + i]);
-        if(group_input_max_uih_seqlens_q[i_grp] > 0)
-            group_max_uih_seqlens_q[i_grp] = group_input_max_uih_seqlens_q[i_grp];
-    }
-
-    // group_max_seqlens_q drives scale_p fallback; identical vector on GPU + reference
-    std::vector<int> group_max_seqlens_q(num_group);
+    // group_max_seqlens_q = MAX packed seqlen over the group's batches, consistent with the
+    // cu_seqlens offset formula (batch_seqlen = seq_lengths_q[b] + num_targets[b] + ctx_grp).
+    // BUGFIX (M6b): the old form used num_targets[i_grp] (group-index into the per-batch
+    // num_targets array), so when a group's LONGEST-packed batch was not batch[i_grp] the
+    // value UNDER-estimated -> max_max_seqlen_q < some batch's real seqlen -> the PRE
+    // hstu_bwd_dot_do_o_kernel (grid bounded by max_seqlen_q) skipped that batch's tail tokens
+    // -> garbage D -> wrong dQ (target rows). Must be a true per-batch max over the group.
+    // (This also drives scale_p fallback for SiLU group when attn_scale==0.)
+    std::vector<int> group_max_seqlens_q(num_group, 0);
     int max_max_seqlen_q = 0;
     for(int i_grp = 0; i_grp < num_group; i_grp++)
     {
-        group_max_seqlens_q[i_grp] = group_max_uih_seqlens_q[i_grp] +
-                                     group_contextual_seqlens[i_grp] +
-                                     (num_targets.empty() ? 0 : num_targets[i_grp]);
+        int grp_max_packed_uih_plus_tgt = 0; // max over batches of (uih_b + target_b)
+        for(int i = 0; i < num_batch_per_group; i++)
+        {
+            const int b = i_grp * num_batch_per_group + i;
+            const int packed_uih_tgt =
+                seq_lengths_q[b] + (num_targets.empty() ? 0 : num_targets[b]);
+            grp_max_packed_uih_plus_tgt = std::max(grp_max_packed_uih_plus_tgt, packed_uih_tgt);
+        }
+        // honor user override of the group's uih cap (adds its own representative target)
+        if(group_input_max_uih_seqlens_q[i_grp] > 0)
+            grp_max_packed_uih_plus_tgt =
+                std::max(grp_max_packed_uih_plus_tgt,
+                         group_input_max_uih_seqlens_q[i_grp] +
+                             (num_targets.empty() ? 0 : num_targets[i_grp * num_batch_per_group]));
+        group_max_seqlens_q[i_grp] =
+            grp_max_packed_uih_plus_tgt + group_contextual_seqlens[i_grp];
         max_max_seqlen_q = std::max(max_max_seqlen_q, group_max_seqlens_q[i_grp]);
     }
 
@@ -675,6 +684,13 @@ bool run_group_hstu_bwd(const ck_tile::ArgParser& arg_parser, int num_group)
                                  group_contextual_seqlens[i_group];
         phy_seqlen_q += batch_seqlen;
         seq_offsets_q.push_back(phy_seqlen_q);
+        // Precondition (M6b): max_seqlen_q must cover EVERY batch's packed seqlen, else the
+        // PRE D kernel (grid bounded by max_seqlen_q) and the fwd grid skip this batch's tail
+        // tokens -> garbage D / missing O,LSE -> wrong dQ. Loudly fail a bad group_max_seqlens_q
+        // rather than silently producing wrong gradients.
+        HSTU_CHECK(max_max_seqlen_q >= batch_seqlen,
+                   "group max_seqlen_q under-covers a batch's packed seqlen (group_max_seqlens_q "
+                   "computed too small)");
     }
     const int phy_seqlen_kv                = phy_seqlen_q;
     const std::vector<int>& seq_offsets_kv = seq_offsets_q;
@@ -742,8 +758,15 @@ bool run_group_hstu_bwd(const ck_tile::ArgParser& arg_parser, int num_group)
     ck_tile::DeviceMem group_min_full_attn_seqlens_dev(group_min_full_attn_seqlens.size() *
                                                        sizeof(int));
 
-    const size_t dq_acc_elems =
+    // M6b group deterministic: dq_acc workspace = single packed slot × num_splits (one slot
+    // per KV-block, no atomic) -> POST reduces over splits. atomic: 1 slot. kN0=128.
+    const bool is_deterministic    = static_cast<bool>(arg_parser.get_int("deterministic"));
+    constexpr int kN0_bwd          = 128;
+    const int num_splits =
+        is_deterministic ? ((max_max_seqlen_q + kN0_bwd - 1) / kN0_bwd) : 1;
+    const size_t single_dq_acc_elems =
         static_cast<size_t>(batches_for_alloc) * phy_seqlen_q * num_head * hdim_qk;
+    const size_t dq_acc_elems = single_dq_acc_elems * static_cast<size_t>(num_splits);
     ck_tile::DeviceMem dq_acc_dev(dq_acc_elems * sizeof(CompDataType));
 
     // softmax (M5b): O (fwd output, used by PRE for D), LSE (fwd), D (PRE). group is
@@ -894,8 +917,12 @@ bool run_group_hstu_bwd(const ck_tile::ArgParser& arg_parser, int num_group)
         bp.dq_acc_ptr           = dq_acc_dev.GetDeviceBuffer();
         bp.stride_dq_acc        = dq_host.get_strides()[1];
         bp.nhead_stride_dq_acc  = dq_host.get_strides()[2];
-        bp.total_dq_acc_elems   = static_cast<int>(dq_acc_elems);
-        bp.kIsDeterministic     = static_cast<bool>(arg_parser.get_int("deterministic"));
+        // total_dq_acc_elems keeps SINGLE-slot semantics (dispatch memsets single*num_splits).
+        bp.total_dq_acc_elems   = static_cast<int>(single_dq_acc_elems);
+        // M6b determ: split slot stride = single-slot elems; num_splits stacks.
+        bp.split_stride_dq_acc  = is_deterministic ? static_cast<ck_tile::index_t>(single_dq_acc_elems) : 0;
+        bp.num_splits           = num_splits;
+        bp.kIsDeterministic     = is_deterministic;
 
         if constexpr(std::is_same<InOutDataType, ck_tile::bf16_t>::value)
             hstu_attention_group_backward_bf16(bp, stream);

@@ -7,19 +7,21 @@
 #include "hstu_attention_bwd_params.hpp"
 #include "hstu_attention_group_backward_dispatch.hpp"
 
-// HSTU attention backward — GROUP bf16 entry point (M4).
+// HSTU attention backward — GROUP bf16 entry point (M4 + M5b softmax + M6b determ).
 //
-// Instantiates the group dispatch directly (no extern-template instance files):
-// only the SiLU causal x {with-local, without-local} pipelines are compiled (the
-// window branch is runtime). softmax/deterministic compile to a runtime throw.
+// Instantiates the group dispatch directly (no extern-template instance files).
+// M6b: kIsDeterministic is a runtime-selected template axis (causal × softmax × determ),
+// so group+deterministic compiles a real determ instance instead of silently running
+// atomic (fixes O1: the old BOOL_SWITCH_2 + hardcoded false made determ unreachable).
 void hstu_attention_group_backward_bf16(HstuAttentionGroupBwdParams& param, hipStream_t stream)
 {
-    BOOL_SWITCH_2(param.use_causal, kUseCausal, param.use_softmax, kUseSoftmax, [&] {
+    BOOL_SWITCH_3(param.use_causal, kUseCausal, param.use_softmax, kUseSoftmax,
+                  param.kIsDeterministic, kIsDeterministic, [&] {
         run_group_backward_dispatch<ck_tile::bf16_t,
                                     kUseCausal,
                                     kUseSoftmax,
                                     false, // kHasBias
-                                    false, // kIsDeterministic
+                                    kIsDeterministic,
                                     64>    // MaxK
             (param, stream);
     });

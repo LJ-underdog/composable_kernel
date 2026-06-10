@@ -83,13 +83,72 @@ struct group_backward_dispatch
         typename TC::BiasDataType,
         FmhaBwdShape,
         false, // kIsGroupMode (FMHA group-mode flag; HSTU group uses jagged indexing in-kernel)
-        false, // kIsDeterministic (M4 atomic)
+        kIsDeterministic, // M6b: deterministic (set+split) vs atomic (false)
         Mask,
         ck_tile::BlockDropoutBwd<false, true, false>,
         false, // kUseTrLoad
         ck_tile::TileFmhaBwdTraits<0, 0,
                                    ck_tile::BlockAttentionBiasEnum::NO_BIAS,
                                    false, 1>>;
+
+    // Shared tail for group SiLU/softmax MAIN: zero dq_acc, launch MAIN, POST. Atomic:
+    // single packed slot -> convert. Deterministic (M6b): num_splits stacked slots (each
+    // KV-block wrote its own via set) -> fixed-order reduce-then-convert (bit-reproducible).
+    template <typename Pipeline, typename Kernel, typename Kargs>
+    static void
+    launch_main_and_post(HstuAttentionGroupBwdParams& param, hipStream_t stream, Kargs& kargs)
+    {
+        const size_t single = static_cast<size_t>(param.total_dq_acc_elems); // one packed slot
+        const int num_splits =
+            kIsDeterministic
+                ? static_cast<int>(
+                      ck_tile::integer_divide_ceil(param.max_seqlen_q, Pipeline::kN0))
+                : 1;
+
+        HIP_CHECK_ERROR(hipMemsetAsync(param.dq_acc_ptr,
+                                       0,
+                                       single * static_cast<size_t>(num_splits) *
+                                           sizeof(typename TC::GemmAccDataType),
+                                       stream));
+
+        dim3 grid  = Kernel::GridSize(param.num_batch, param.num_head, param.max_seqlen_q);
+        dim3 block = Kernel::BlockSize();
+        constexpr ck_tile::index_t kBlockPerCu = Kernel::kBlockPerCu;
+        (void)ck_tile::launch_kernel(
+            ck_tile::stream_config{stream, false},
+            ck_tile::make_kernel<kBlockPerCu>(Kernel{}, grid, block, 0, kargs));
+
+        const ck_tile::long_index_t n = static_cast<ck_tile::long_index_t>(single);
+        constexpr int kPostThreads = 256;
+        const int post_blocks      = static_cast<int>((n + kPostThreads - 1) / kPostThreads);
+        if constexpr(kIsDeterministic)
+        {
+            hipLaunchKernelGGL(
+                (ck_tile::hstu_bwd_reduce_convert_dq_kernel<InOutDataType,
+                                                            typename TC::GemmAccDataType>),
+                dim3(post_blocks),
+                dim3(kPostThreads),
+                0,
+                stream,
+                reinterpret_cast<const typename TC::GemmAccDataType*>(param.dq_acc_ptr),
+                reinterpret_cast<InOutDataType*>(param.dq_ptr),
+                n,
+                num_splits,
+                static_cast<ck_tile::long_index_t>(single));
+        }
+        else
+        {
+            hipLaunchKernelGGL(
+                (ck_tile::hstu_bwd_convert_dq_kernel<InOutDataType, typename TC::GemmAccDataType>),
+                dim3(post_blocks),
+                dim3(kPostThreads),
+                0,
+                stream,
+                reinterpret_cast<const typename TC::GemmAccDataType*>(param.dq_acc_ptr),
+                reinterpret_cast<InOutDataType*>(param.dq_ptr),
+                n);
+        }
+    }
 
     static void RunSilu(HstuAttentionGroupBwdParams& param, hipStream_t stream)
     {
@@ -152,38 +211,10 @@ struct group_backward_dispatch
                                        param.nhead_stride_do,
                                        param.nhead_stride_dk,
                                        param.nhead_stride_dv,
-                                       param.nhead_stride_dq_acc);
+                                       param.nhead_stride_dq_acc,
+                                       param.split_stride_dq_acc);
 
-        // zero the float dq_acc workspace (whole packed buffer) before atomic add
-        HIP_CHECK_ERROR(hipMemsetAsync(param.dq_acc_ptr,
-                                       0,
-                                       static_cast<size_t>(param.total_dq_acc_elems) *
-                                           sizeof(typename TC::GemmAccDataType),
-                                       stream));
-
-        // grid.x covers the largest group seqlen; short groups early-exit per block
-        dim3 grid  = Kernel::GridSize(param.num_batch, param.num_head, param.max_seqlen_q);
-        dim3 block = Kernel::BlockSize();
-        constexpr ck_tile::index_t kBlockPerCu = Kernel::kBlockPerCu;
-
-        (void)ck_tile::launch_kernel(
-            ck_tile::stream_config{stream, false},
-            ck_tile::make_kernel<kBlockPerCu>(Kernel{}, grid, block, 0, kargs));
-
-        // POST: convert dq_acc(float) -> dq(InOutDataType) elementwise (atomic, nsplits=1)
-        const ck_tile::long_index_t n =
-            static_cast<ck_tile::long_index_t>(param.total_dq_acc_elems);
-        constexpr int kPostThreads = 256;
-        const int post_blocks      = static_cast<int>((n + kPostThreads - 1) / kPostThreads);
-        hipLaunchKernelGGL(
-            (ck_tile::hstu_bwd_convert_dq_kernel<InOutDataType, typename TC::GemmAccDataType>),
-            dim3(post_blocks),
-            dim3(kPostThreads),
-            0,
-            stream,
-            reinterpret_cast<const typename TC::GemmAccDataType*>(param.dq_acc_ptr),
-            reinterpret_cast<InOutDataType*>(param.dq_ptr),
-            n);
+        launch_main_and_post<PipelineLocal, Kernel>(param, stream, kargs);
     }
 
     // M5b group softmax. PRE (D=rowsum(O*dO)) -> memset dq_acc -> MAIN (group softmax
@@ -279,35 +310,10 @@ struct group_backward_dispatch
                                        param.nhead_stride_dk,
                                        param.nhead_stride_dv,
                                        param.nhead_stride_dq_acc,
-                                       param.nhead_stride_lsed);
+                                       param.nhead_stride_lsed,
+                                       param.split_stride_dq_acc);
 
-        HIP_CHECK_ERROR(hipMemsetAsync(param.dq_acc_ptr,
-                                       0,
-                                       static_cast<size_t>(param.total_dq_acc_elems) *
-                                           sizeof(typename TC::GemmAccDataType),
-                                       stream));
-
-        dim3 grid  = Kernel::GridSize(param.num_batch, param.num_head, param.max_seqlen_q);
-        dim3 block = Kernel::BlockSize();
-        constexpr ck_tile::index_t kBlockPerCu = Kernel::kBlockPerCu;
-
-        (void)ck_tile::launch_kernel(
-            ck_tile::stream_config{stream, false},
-            ck_tile::make_kernel<kBlockPerCu>(Kernel{}, grid, block, 0, kargs));
-
-        const ck_tile::long_index_t n =
-            static_cast<ck_tile::long_index_t>(param.total_dq_acc_elems);
-        constexpr int kPostThreads = 256;
-        const int post_blocks      = static_cast<int>((n + kPostThreads - 1) / kPostThreads);
-        hipLaunchKernelGGL(
-            (ck_tile::hstu_bwd_convert_dq_kernel<InOutDataType, typename TC::GemmAccDataType>),
-            dim3(post_blocks),
-            dim3(kPostThreads),
-            0,
-            stream,
-            reinterpret_cast<const typename TC::GemmAccDataType*>(param.dq_acc_ptr),
-            reinterpret_cast<InOutDataType*>(param.dq_ptr),
-            n);
+        launch_main_and_post<PipelineLocal, Kernel>(param, stream, kargs);
     }
 
     static void Run(HstuAttentionGroupBwdParams& param, hipStream_t stream)
@@ -315,10 +321,10 @@ struct group_backward_dispatch
         if(param.hdim_qk != 64 || param.hdim_v != 64)
             throw std::runtime_error("HSTU bwd group supports hdim_qk=hdim_v=64 only (M7)");
 
-        if constexpr(kIsDeterministic)
-            throw std::runtime_error("HSTU bwd: deterministic path not implemented yet (M6)");
-        else if constexpr(kUseSoftmax)
-            RunSoftmax(param, stream); // M5b
+        // M6b: kIsDeterministic threaded into the Problem/kernel (set+split dq_acc + reduce
+        // POST). Both SiLU and softmax group paths support atomic & deterministic.
+        if constexpr(kUseSoftmax)
+            RunSoftmax(param, stream); // M5b / M6b
         else
             RunSilu(param, stream);
     }

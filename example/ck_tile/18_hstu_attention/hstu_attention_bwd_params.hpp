@@ -178,11 +178,14 @@ struct HstuAttentionGroupBwdParams
     ck_tile::index_t nhead_stride_dk;
     ck_tile::index_t nhead_stride_dv;
 
-    // ---- dQ workspace (float dq_acc, atomic path nsplits=1) ------------------
+    // ---- dQ workspace (float dq_acc) ----------------------------------------
     void* dq_acc_ptr;
     ck_tile::index_t stride_dq_acc;       // token stride (== H*hdim_qk)
     ck_tile::index_t nhead_stride_dq_acc; // == hdim_qk
-    ck_tile::index_t total_dq_acc_elems;  // ΣL*H*hdim_qk (whole packed buffer)
+    ck_tile::index_t total_dq_acc_elems;  // single packed slot = ΣL*H*hdim_qk
+    // M6b deterministic: dq_acc has num_splits stacked single-slots; split_stride = one slot.
+    ck_tile::index_t split_stride_dq_acc; // == total_dq_acc_elems (determ); 0 (atomic)
+    int num_splits;                       // determ: ceil(max_seqlen_q/kN0); atomic: 1
 
     bool kIsDeterministic; // M6
 };
