@@ -109,7 +109,7 @@ auto create_args(int argc, char* argv[])
     // clang-format off
     arg_parser.insert("v", "1", "whether do CPU validation (reference bwd) or not")
         .insert("bwd_v", "1", "alias of -v for the bwd harness; either enables validation")
-        .insert("prec", "bf16", "data type. bf16 (fp16 backward not in M0)")
+        .insert("prec", "bf16", "data type. bf16 or fp16 (M7a added fp16 backward)")
         .insert("b", "2", "number of batches")
         .insert("nhead", "2", "number of heads")
         .insert("hdim_qk", "64", "headdim size of Q/K")
@@ -386,8 +386,10 @@ bool run_no_group_hstu_bwd(const ck_tile::ArgParser& arg_parser)
 
         if constexpr(std::is_same<InOutDataType, ck_tile::bf16_t>::value)
             hstu_attention_no_group_forward_bf16(fp, stream);
+        else if constexpr(std::is_same<InOutDataType, ck_tile::fp16_t>::value)
+            hstu_attention_no_group_forward_fp16(fp, stream);
         else
-            throw std::runtime_error("M0 bwd harness only wires the bf16 forward path");
+            throw std::runtime_error("bwd harness only wires bf16/fp16 forward paths");
 
         HIP_CHECK_ERROR(hipStreamSynchronize(stream));
         o_dev.FromDevice(o_host.data());
@@ -482,8 +484,10 @@ bool run_no_group_hstu_bwd(const ck_tile::ArgParser& arg_parser)
 
         if constexpr(std::is_same<InOutDataType, ck_tile::bf16_t>::value)
             hstu_attention_no_group_backward_bf16(bp, stream);
+        else if constexpr(std::is_same<InOutDataType, ck_tile::fp16_t>::value)
+            hstu_attention_no_group_backward_fp16(bp, stream);
         else
-            throw std::runtime_error("M0 bwd harness only wires the bf16 backward path");
+            throw std::runtime_error("bwd harness only wires bf16/fp16 backward paths");
 
         HIP_CHECK_ERROR(hipStreamSynchronize(stream));
         dq_dev.FromDevice(dq_host.data());
@@ -845,8 +849,10 @@ bool run_group_hstu_bwd(const ck_tile::ArgParser& arg_parser, int num_group)
 
         if constexpr(std::is_same<InOutDataType, ck_tile::bf16_t>::value)
             hstu_attention_group_forward_bf16(fp, stream);
+        else if constexpr(std::is_same<InOutDataType, ck_tile::fp16_t>::value)
+            hstu_attention_group_forward_fp16(fp, stream);
         else
-            throw std::runtime_error("group bwd harness only wires the bf16 forward path");
+            throw std::runtime_error("group bwd harness only wires bf16/fp16 forward paths");
 
         HIP_CHECK_ERROR(hipStreamSynchronize(stream));
         o_dev.FromDevice(o_host.data());
@@ -926,8 +932,10 @@ bool run_group_hstu_bwd(const ck_tile::ArgParser& arg_parser, int num_group)
 
         if constexpr(std::is_same<InOutDataType, ck_tile::bf16_t>::value)
             hstu_attention_group_backward_bf16(bp, stream);
+        else if constexpr(std::is_same<InOutDataType, ck_tile::fp16_t>::value)
+            hstu_attention_group_backward_fp16(bp, stream);
         else
-            throw std::runtime_error("group bwd harness only wires the bf16 path");
+            throw std::runtime_error("group bwd harness only wires bf16/fp16 backward paths");
 
         HIP_CHECK_ERROR(hipStreamSynchronize(stream));
         dq_dev.FromDevice(dq_host.data());
@@ -1035,16 +1043,23 @@ int main(int argc, char* argv[])
     const std::string data_type = arg_parser.get_str("prec");
     const int num_group         = arg_parser.get_int("g");
 
-    if(data_type != "bf16")
+    if(data_type != "bf16" && data_type != "fp16")
     {
-        std::cerr << "M0 bwd harness only supports -prec=bf16" << std::endl;
+        std::cerr << "bwd harness only supports -prec=bf16 or -prec=fp16" << std::endl;
         return -3;
     }
 
     // num_group>1 routes to the group HSTU path (M4); otherwise no_group (batched/jagged).
-    bool numeric_pass = (num_group > 1)
-                            ? run_group_hstu_bwd<ck_tile::bf16_t>(arg_parser, num_group)
-                            : run_no_group_hstu_bwd<ck_tile::bf16_t>(arg_parser);
+    // M7a: dtype is selected at runtime from -prec (fp16 reuses the bf16 code path).
+    bool numeric_pass;
+    if(data_type == "fp16")
+        numeric_pass = (num_group > 1)
+                           ? run_group_hstu_bwd<ck_tile::fp16_t>(arg_parser, num_group)
+                           : run_no_group_hstu_bwd<ck_tile::fp16_t>(arg_parser);
+    else
+        numeric_pass = (num_group > 1)
+                           ? run_group_hstu_bwd<ck_tile::bf16_t>(arg_parser, num_group)
+                           : run_no_group_hstu_bwd<ck_tile::bf16_t>(arg_parser);
 
     // M1: real SiLU MAIN — exit code is driven by numerical correctness.
     std::cout << "numeric_pass=" << (numeric_pass ? "true" : "false") << std::endl;

@@ -30,15 +30,21 @@ set(EXAMPLE_HSTU_ATTENTION_BWD "tile_example_hstu_attention_bwd")
 message("adding example ${EXAMPLE_HSTU_ATTENTION_BWD}")
 file(GLOB BWD_INSTANCE_SRCS instances/*backward*.cpp)
 # the bwd harness runs the GPU forward (to produce O) before the backward, so it
-# also needs the bf16 forward entry + forward bf16 instances linked in.
+# also needs the forward entries + forward instances linked in. M7a added the
+# fp16 path, so both bf16 and fp16 forward instances are pulled in.
 file(GLOB FWD_BF16_INSTANCE_SRCS instances/*forward_bf16*.cpp)
+file(GLOB FWD_FP16_INSTANCE_SRCS instances/*forward_fp16*.cpp)
 set(BWD_INTERFACES_SRCS hstu_attention_no_group_backward_bf16.cpp
+                        hstu_attention_no_group_backward_fp16.cpp
                         hstu_attention_group_backward_bf16.cpp
+                        hstu_attention_group_backward_fp16.cpp
                         hstu_attention_no_group_forward_bf16.cpp
-                        hstu_attention_group_forward_bf16.cpp)
+                        hstu_attention_no_group_forward_fp16.cpp
+                        hstu_attention_group_forward_bf16.cpp
+                        hstu_attention_group_forward_fp16.cpp)
 add_executable(${EXAMPLE_HSTU_ATTENTION_BWD} EXCLUDE_FROM_ALL example_hstu_attention_bwd.cpp)
 target_include_directories(${EXAMPLE_HSTU_ATTENTION_BWD} PRIVATE ${CMAKE_CURRENT_LIST_DIR})
-target_sources(${EXAMPLE_HSTU_ATTENTION_BWD} PRIVATE ${BWD_INTERFACES_SRCS} ${BWD_INSTANCE_SRCS} ${FWD_BF16_INSTANCE_SRCS})
+target_sources(${EXAMPLE_HSTU_ATTENTION_BWD} PRIVATE ${BWD_INTERFACES_SRCS} ${BWD_INSTANCE_SRCS} ${FWD_BF16_INSTANCE_SRCS} ${FWD_FP16_INSTANCE_SRCS})
 
 set(EXAMPLE_HSTU_ATTENTION_BWD_COMPILE_OPTIONS)
 list(APPEND EXAMPLE_HSTU_ATTENTION_BWD_COMPILE_OPTIONS -Wno-undefined-func-template -Wno-float-equal -DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=3)
