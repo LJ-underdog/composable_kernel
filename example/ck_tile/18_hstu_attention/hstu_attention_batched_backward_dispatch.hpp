@@ -20,6 +20,7 @@
 #include "hstu_attention_no_softmax_bwd_pipeline.hpp"
 #include "hstu_attention_with_softmax_bwd_pipeline.hpp"
 #include "hstu_attention_bwd_kernel.hpp"
+#include "hstu_attention_bwd_shape.hpp"
 
 // HSTU attention backward — batched NoGroup dispatch (M1: SiLU + no-mask + atomic).
 //
@@ -40,27 +41,10 @@ template <typename InOutDataType,
           ck_tile::index_t MaxK>
 struct batched_backward_dispatch
 {
-    // --- M1 hd64 tile (FMHA bwd '64' preset; warp_tile0 16x16x32 = CDNA4 K-doubled MFMA) ---
-    using FmhaBlockTile = ck_tile::sequence<32, 128, 64, 32, 64, 32, 32, 64, 64>;
-    using BlockWarps0   = ck_tile::sequence<1, 4, 1>;
-    using BlockWarps1   = ck_tile::sequence<4, 1, 1>;
-    using BlockWarps2   = ck_tile::sequence<1, 4, 1>;
-    using WarpTile0     = ck_tile::sequence<16, 16, 32>;
-    using WarpTile1     = ck_tile::sequence<16, 16, 16>;
-
-    // Gemm4WarpTile = sequence<wm0,wn0,min(wk0,bk4)> = <16,16,32> = WarpTile0 (hd64)
-    using FmhaBwdShape = ck_tile::TileFmhaBwdShape<FmhaBlockTile,
-                                                   BlockWarps0,
-                                                   WarpTile0,
-                                                   BlockWarps1,
-                                                   WarpTile1,
-                                                   BlockWarps0,
-                                                   WarpTile0,
-                                                   BlockWarps1,
-                                                   WarpTile1,
-                                                   BlockWarps2,
-                                                   WarpTile0,
-                                                   0 /* kMaxSeqLenQ: 0 = unlimited */>;
+    // M7b: tile shape is now selected by MaxK (HstuBwdShape<MaxK>). HstuBwdShape<64>
+    // is byte-identical to the pre-M7b hardcoded hd64 preset (FMHA bwd '64' preset;
+    // warp_tile0 16x16x32 = CDNA4 K-doubled MFMA), so the hd64 path is unchanged.
+    using FmhaBwdShape = typename HstuBwdShape<MaxK>::Type;
 
     using TC = HstuAttentionFwdTypeConfig<InOutDataType>;
 
@@ -386,9 +370,14 @@ struct batched_backward_dispatch
 
         if constexpr(kUseSoftmax)
         {
-            // M5: softmax (no_group = batched + jagged). hdim64 only.
-            if(param.hdim_qk != 64 || param.hdim_v != 64)
-                throw std::runtime_error("HSTU bwd M5 softmax supports hdim_qk=hdim_v=64 only (M7)");
+            // M5/M7b: softmax (no_group = batched + jagged). symmetric hdim ∈ {64,96,128,256}.
+            // MaxK is the canonical tile picked by HDIM_SWITCH; require hdim_qk==hdim_v==MaxK so
+            // the head-dim fits the tile exactly (no padding) — reject non-canonical hdims that
+            // HDIM_SWITCH would silently round up to a larger tile (M7c handles hdim_qk!=hdim_v
+            // and arbitrary hdim via the fwd-style pad switch).
+            if(param.hdim_qk != param.hdim_v || param.hdim_qk != MaxK)
+                throw std::runtime_error(
+                    "HSTU bwd softmax supports symmetric hdim_qk==hdim_v in {64,96,128,256} only");
 
             const bool use_local = (param.window_size > 0);
             BOOL_SWITCH(use_local, kUseLocal, [&] {
@@ -399,12 +388,15 @@ struct batched_backward_dispatch
         }
         else
         {
-            // M1/M2: SiLU. hdim64 only. (seqlen never padded — OOB via buffer_load)
+            // M1/M2: SiLU. (seqlen never padded — OOB via buffer_load)
             // M2: HSTU 5-factor mask (causal/window/contextual/min_full/num_target).
             // kUseLocal selected at runtime by window_size>0 (mirrors fwd). kUseCausal=0 &
             // window=0 -> NoLocal<false> with IsMasking=false (== M1 no-mask).
-            if(param.hdim_qk != 64 || param.hdim_v != 64)
-                throw std::runtime_error("HSTU bwd M1/M2 supports hdim_qk=hdim_v=64 only (M7)");
+            // M7b: symmetric hdim ∈ {64,96,128,256}; require hdim_qk==hdim_v==MaxK (see softmax
+            // branch above for the rationale / non-canonical guard).
+            if(param.hdim_qk != param.hdim_v || param.hdim_qk != MaxK)
+                throw std::runtime_error(
+                    "HSTU bwd SiLU supports symmetric hdim_qk==hdim_v in {64,96,128,256} only");
 
             const bool use_local = (param.window_size > 0);
             BOOL_SWITCH(use_local, kUseLocal, [&] {

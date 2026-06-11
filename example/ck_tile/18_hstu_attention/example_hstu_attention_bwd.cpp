@@ -296,9 +296,11 @@ bool run_no_group_hstu_bwd(const ck_tile::ArgParser& arg_parser)
 
     // float dQ accumulation workspace. atomic: 1 slot (same packed layout as dQ). M6
     // deterministic: num_splits stacked slots (one per KV-block) -> POST reduces over them.
-    // num_splits = ceil(grid_seqlen_kv / kN0); kN0=128 (hd64 bwd preset, matches dispatch).
+    // num_splits = ceil(grid_seqlen_kv / kN0); kN0 = the bwd tile's bn0 (k-seqlen block),
+    // which MUST match the dispatch's Pipeline::kN0 or the determ reduce overruns. hd256's
+    // preset uses bn0=64 (all other hdims use 128) — see HstuBwdShape<256> (M7b).
     const bool is_deterministic = static_cast<bool>(arg_parser.get_int("deterministic"));
-    constexpr int kN0_bwd       = 128;
+    const int kN0_bwd           = (hdim_qk == 256) ? 64 : 128;
     const int grid_seqlen_kv_h  = is_jagged ? max_seqlen_q : phy_seqlen_kv;
     const int num_splits =
         is_deterministic ? ((grid_seqlen_kv_h + kN0_bwd - 1) / kN0_bwd) : 1;
@@ -763,9 +765,10 @@ bool run_group_hstu_bwd(const ck_tile::ArgParser& arg_parser, int num_group)
                                                        sizeof(int));
 
     // M6b group deterministic: dq_acc workspace = single packed slot × num_splits (one slot
-    // per KV-block, no atomic) -> POST reduces over splits. atomic: 1 slot. kN0=128.
+    // per KV-block, no atomic) -> POST reduces over splits. atomic: 1 slot. kN0 = tile bn0
+    // (hd256: 64, else 128) — must match the dispatch's Pipeline::kN0 (M7b).
     const bool is_deterministic    = static_cast<bool>(arg_parser.get_int("deterministic"));
-    constexpr int kN0_bwd          = 128;
+    const int kN0_bwd              = (hdim_qk == 256) ? 64 : 128;
     const int num_splits =
         is_deterministic ? ((max_max_seqlen_q + kN0_bwd - 1) / kN0_bwd) : 1;
     const size_t single_dq_acc_elems =

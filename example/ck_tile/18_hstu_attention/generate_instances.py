@@ -166,14 +166,16 @@ BOOL_MAP_DETERMINISTIC = {
     False: "atomic",
 }
 
-# Backward axes (DESIGN §4.5 MVP + M7a fp16):
-#   mode=batched, dtype={fp16,bf16}, bias=false, deterministic={false,true}, maxk=64,
+# Backward axes (DESIGN §4.5 MVP + M7a fp16 + M7b hdim):
+#   mode=batched, dtype={fp16,bf16}, bias=false, deterministic={false,true},
+#   maxk={64,96,128,256} (symmetric hdim_qk==hdim_v; tile shape per HstuBwdShape<MaxK>),
 #   causal x softmax = the 4 combos the NoGroup entry switches over.
-# M7a added the dtype axis (aligns with the fwd generator's ["fp16","bf16"]);
-# hdim variants (96/128/256) and hdim_qk!=hdim_v remain M7b/M7c.
+# M7a added the dtype axis; M7b added the headdim axis (aligns with the fwd generator's
+# headdims_fwd). hdim_qk!=hdim_v + arbitrary (non-canonical) hdim via pad switch remain M7c.
+# Instance count = 2 dtype x 2 causal x 2 softmax x 2 determ x 4 hdim = 64 batched bwd .cpp.
 BWD_MODES_M0 = ["batched"]
 BWD_DTYPES_M0 = ["fp16", "bf16"]
-BWD_HEADDIMS_M0 = [64]
+BWD_HEADDIMS_M0 = [64, 96, 128, 256]
 
 
 def create_backward_instances(instance_dir: Path) -> None:

@@ -20,6 +20,7 @@
 #include "hstu_attention_no_softmax_bwd_pipeline.hpp"
 #include "hstu_attention_with_softmax_bwd_pipeline.hpp"
 #include "hstu_attention_bwd_kernel.hpp"
+#include "hstu_attention_bwd_shape.hpp"
 
 // HSTU attention backward — GROUP dispatch (M4: SiLU + atomic).
 //
@@ -41,26 +42,9 @@ template <typename InOutDataType,
           ck_tile::index_t MaxK>
 struct group_backward_dispatch
 {
-    // hd64 tile (identical to the no_group/batched preset)
-    using FmhaBlockTile = ck_tile::sequence<32, 128, 64, 32, 64, 32, 32, 64, 64>;
-    using BlockWarps0   = ck_tile::sequence<1, 4, 1>;
-    using BlockWarps1   = ck_tile::sequence<4, 1, 1>;
-    using BlockWarps2   = ck_tile::sequence<1, 4, 1>;
-    using WarpTile0     = ck_tile::sequence<16, 16, 32>;
-    using WarpTile1     = ck_tile::sequence<16, 16, 16>;
-
-    using FmhaBwdShape = ck_tile::TileFmhaBwdShape<FmhaBlockTile,
-                                                   BlockWarps0,
-                                                   WarpTile0,
-                                                   BlockWarps1,
-                                                   WarpTile1,
-                                                   BlockWarps0,
-                                                   WarpTile0,
-                                                   BlockWarps1,
-                                                   WarpTile1,
-                                                   BlockWarps2,
-                                                   WarpTile0,
-                                                   0 /* kMaxSeqLenQ */>;
+    // M7b: tile shape selected by MaxK (HstuBwdShape<MaxK>); <64> is byte-identical
+    // to the pre-M7b hardcoded preset (identical to the no_group/batched preset).
+    using FmhaBwdShape = typename HstuBwdShape<MaxK>::Type;
 
     using TC = HstuAttentionFwdTypeConfig<InOutDataType>;
 
@@ -318,8 +302,13 @@ struct group_backward_dispatch
 
     static void Run(HstuAttentionGroupBwdParams& param, hipStream_t stream)
     {
-        if(param.hdim_qk != 64 || param.hdim_v != 64)
-            throw std::runtime_error("HSTU bwd group supports hdim_qk=hdim_v=64 only (M7)");
+        // M7b: symmetric hdim ∈ {64,96,128,256}; require hdim_qk==hdim_v==MaxK (the canonical
+        // tile HDIM_SWITCH picked) so the head-dim fits the tile exactly (no padding). Rejects
+        // non-canonical hdims that would silently round up to a larger tile. (M7c: hdim_qk!=hdim_v
+        // + arbitrary hdim via the fwd-style pad switch.)
+        if(param.hdim_qk != param.hdim_v || param.hdim_qk != MaxK)
+            throw std::runtime_error(
+                "HSTU bwd group supports symmetric hdim_qk==hdim_v in {64,96,128,256} only");
 
         // M6b: kIsDeterministic threaded into the Problem/kernel (set+split dq_acc + reduce
         // POST). Both SiLU and softmax group paths support atomic & deterministic.
