@@ -166,11 +166,13 @@ BOOL_MAP_DETERMINISTIC = {
     False: "atomic",
 }
 
-# M0 backward axes (DESIGN §4.5 MVP, scaffold subset):
-#   mode=batched, dtype=bf16, bias=false, deterministic=false, maxk=64,
-#   causal x softmax = the 4 combos the NoGroup bf16 entry switches over.
+# Backward axes (DESIGN §4.5 MVP + M7a fp16):
+#   mode=batched, dtype={fp16,bf16}, bias=false, deterministic={false,true}, maxk=64,
+#   causal x softmax = the 4 combos the NoGroup entry switches over.
+# M7a added the dtype axis (aligns with the fwd generator's ["fp16","bf16"]);
+# hdim variants (96/128/256) and hdim_qk!=hdim_v remain M7b/M7c.
 BWD_MODES_M0 = ["batched"]
-BWD_DTYPES_M0 = ["bf16"]
+BWD_DTYPES_M0 = ["fp16", "bf16"]
 BWD_HEADDIMS_M0 = [64]
 
 
