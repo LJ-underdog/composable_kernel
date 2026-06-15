@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <limits>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -128,6 +129,9 @@ auto create_args(int argc, char* argv[])
         .insert("attn_scale", "0", "scale of SiLU(Q@K). 0 means 1/max_seqlen_q")
         .insert("deterministic", "0", "deterministic dQ path (M0/M1: 0)")
         .insert("dump_grad", "0", "dump device and reference gradients to files")
+        .insert("poison_pad", "0", "M7c: over-alloc head-dim to MaxK, NaN-fill input pad tails + "
+                                   "pre-poison output pad tails -> positively prove OOB head-dim "
+                                   "load-zero / store-skip (any leak -> NaN -> hard FAIL)")
         // group mode (M4): num_group>1 enables group HSTU (packed + per-group hyper-params)
         .insert("g", "1", "num attention groups; >1 enables group HSTU (num_batch must be a multiple)")
         .insert("g_max_seqlens", "0", "per-group max uih seqlen (comma list); 0 = derive from seqlens")
@@ -151,6 +155,21 @@ template <>
 auto get_bwd_elimit<ck_tile::fp16_t>()
 {
     return ck_tile::make_tuple(/*rtol*/ 5e-3, /*atol*/ 1e-2);
+}
+
+// M7c: the canonical MaxK tile that HDIM_SWITCH picks for (hdim_qk,hdim_v) = the smallest
+// canonical head dim >= max(hdim_qk,hdim_v). Used to size the determ dq_acc workspace by the
+// SELECTED tile's kN0 (bn0): hd256 tile uses kN0=64, all others 128. Keying off raw hdim_qk
+// under-allocates when a non-canonical hdim (e.g. 200) buckets up to MaxK=256. Mirrors
+// hstu_attention_hdim_switch.hpp.
+static inline int bwd_selected_maxk(int hdim_qk, int hdim_v)
+{
+    const int m = std::max(hdim_qk, hdim_v);
+    return m <= 64 ? 64 : m <= 96 ? 96 : m <= 128 ? 128 : 256;
+}
+static inline int bwd_kN0_for(int hdim_qk, int hdim_v)
+{
+    return (bwd_selected_maxk(hdim_qk, hdim_v) == 256) ? 64 : 128;
 }
 
 template <typename InOutDataType>
@@ -236,28 +255,39 @@ bool run_no_group_hstu_bwd(const ck_tile::ArgParser& arg_parser)
 
     using CompDataType = typename HstuAttentionFwdTypeConfig<InOutDataType>::CompDataType;
 
-    // ---- host tensors (dim0 = 1 packed when jagged) --------------------------
+    // ---- M7c poison-pad: over-allocate the head-dim to the SELECTED canonical tile (MaxK) so
+    // the padded columns are physically present (NaN-filled), positively proving the kernel's
+    // OOB head-dim load-zero / store-skip. The GPU-facing host tensors use ahdim_{qk,v}; the
+    // strides/alloc/upload all follow automatically from the tensor shape. The CPU REFERENCE
+    // must see only the real hdim columns -> it is fed real-hdim copies (built below). When
+    // poison_pad is off, ahdim==real so every path is byte-identical to M7b. ----
+    const bool poison_pad = static_cast<bool>(arg_parser.get_int("poison_pad"));
+    const int  sel_maxk   = bwd_selected_maxk(hdim_qk, hdim_v);
+    const int  ahdim_qk   = poison_pad ? sel_maxk : hdim_qk;
+    const int  ahdim_v    = poison_pad ? sel_maxk : hdim_v;
+
+    // ---- host tensors (dim0 = 1 packed when jagged; head-dim = ahdim when poison_pad) -------
     ck_tile::HostTensor<InOutDataType> q_host(
-        std::array<ck_tile::index_t, 4>{batches_for_alloc, phy_seqlen_q, num_head, hdim_qk});
+        std::array<ck_tile::index_t, 4>{batches_for_alloc, phy_seqlen_q, num_head, ahdim_qk});
     ck_tile::HostTensor<InOutDataType> k_host(
-        std::array<ck_tile::index_t, 4>{batches_for_alloc, phy_seqlen_kv, num_head, hdim_qk});
+        std::array<ck_tile::index_t, 4>{batches_for_alloc, phy_seqlen_kv, num_head, ahdim_qk});
     ck_tile::HostTensor<InOutDataType> v_host(
-        std::array<ck_tile::index_t, 4>{batches_for_alloc, phy_seqlen_kv, num_head, hdim_v});
+        std::array<ck_tile::index_t, 4>{batches_for_alloc, phy_seqlen_kv, num_head, ahdim_v});
     ck_tile::HostTensor<InOutDataType> o_host(
-        std::array<ck_tile::index_t, 4>{batches_for_alloc, phy_seqlen_q, num_head, hdim_v});
+        std::array<ck_tile::index_t, 4>{batches_for_alloc, phy_seqlen_q, num_head, ahdim_v});
     ck_tile::HostTensor<InOutDataType> do_host(
-        std::array<ck_tile::index_t, 4>{batches_for_alloc, phy_seqlen_q, num_head, hdim_v});
+        std::array<ck_tile::index_t, 4>{batches_for_alloc, phy_seqlen_q, num_head, ahdim_v});
     // LSE (softmax path only); allocated to satisfy the reference signature.
     ck_tile::HostTensor<CompDataType> lse_host(
         std::array<ck_tile::index_t, 3>{batches_for_alloc, phy_seqlen_q, num_head});
 
-    // gradient outputs (GPU) and references (CPU)
+    // gradient outputs (GPU; head-dim = ahdim) and references (CPU; always REAL hdim)
     ck_tile::HostTensor<InOutDataType> dq_host(
-        std::array<ck_tile::index_t, 4>{batches_for_alloc, phy_seqlen_q, num_head, hdim_qk});
+        std::array<ck_tile::index_t, 4>{batches_for_alloc, phy_seqlen_q, num_head, ahdim_qk});
     ck_tile::HostTensor<InOutDataType> dk_host(
-        std::array<ck_tile::index_t, 4>{batches_for_alloc, phy_seqlen_kv, num_head, hdim_qk});
+        std::array<ck_tile::index_t, 4>{batches_for_alloc, phy_seqlen_kv, num_head, ahdim_qk});
     ck_tile::HostTensor<InOutDataType> dv_host(
-        std::array<ck_tile::index_t, 4>{batches_for_alloc, phy_seqlen_kv, num_head, hdim_v});
+        std::array<ck_tile::index_t, 4>{batches_for_alloc, phy_seqlen_kv, num_head, ahdim_v});
     ck_tile::HostTensor<InOutDataType> dq_host_ref(
         std::array<ck_tile::index_t, 4>{batches_for_alloc, phy_seqlen_q, num_head, hdim_qk});
     ck_tile::HostTensor<InOutDataType> dk_host_ref(
@@ -280,6 +310,37 @@ bool run_no_group_hstu_bwd(const ck_tile::ArgParser& arg_parser)
         ck_tile::FillUniformDistribution<InOutDataType>{-1.f, 1.f, seed + 3}(do_host);
     }
 
+    // ---- M7c poison helpers (no-ops when poison_pad off) --------------------------------
+    const InOutDataType nan_v =
+        ck_tile::type_convert<InOutDataType>(std::numeric_limits<float>::quiet_NaN());
+    // NaN-fill the padded head-dim tail [real_hd, ahdim) of a GPU input: any masked OOB load
+    // that leaks (instead of returning 0) propagates NaN -> output NaN -> hard FAIL.
+    auto fill_pad_nan = [&](ck_tile::HostTensor<InOutDataType>& t, int real_hd) {
+        const int B = t.get_lengths()[0], S = t.get_lengths()[1];
+        const int H = t.get_lengths()[2], D = t.get_lengths()[3];
+        for(int b = 0; b < B; ++b)
+            for(int s = 0; s < S; ++s)
+                for(int h = 0; h < H; ++h)
+                    for(int d = real_hd; d < D; ++d)
+                        t(b, s, h, d) = nan_v;
+    };
+    auto fill_all_nan = [&](ck_tile::HostTensor<InOutDataType>& t) {
+        for(size_t i = 0; i < t.get_element_space_size(); ++i)
+            t.data()[i] = nan_v;
+    };
+    if(poison_pad)
+    {
+        fill_pad_nan(q_host, hdim_qk);
+        fill_pad_nan(k_host, hdim_qk);
+        fill_pad_nan(v_host, hdim_v);
+        fill_pad_nan(do_host, hdim_v);
+        // pre-poison GPU outputs: real columns get overwritten; padded tail MUST stay NaN
+        // (store-skip). Uploaded below so the device buffers start poisoned.
+        fill_all_nan(dq_host);
+        fill_all_nan(dk_host);
+        fill_all_nan(dv_host);
+    }
+
     // ---- device buffers ------------------------------------------------------
     ck_tile::DeviceMem q_dev(q_host.get_element_space_size_in_bytes());
     ck_tile::DeviceMem k_dev(k_host.get_element_space_size_in_bytes());
@@ -297,15 +358,16 @@ bool run_no_group_hstu_bwd(const ck_tile::ArgParser& arg_parser)
     // float dQ accumulation workspace. atomic: 1 slot (same packed layout as dQ). M6
     // deterministic: num_splits stacked slots (one per KV-block) -> POST reduces over them.
     // num_splits = ceil(grid_seqlen_kv / kN0); kN0 = the bwd tile's bn0 (k-seqlen block),
-    // which MUST match the dispatch's Pipeline::kN0 or the determ reduce overruns. hd256's
-    // preset uses bn0=64 (all other hdims use 128) — see HstuBwdShape<256> (M7b).
+    // which MUST match the dispatch's Pipeline::kN0 or the determ reduce overruns. M7c: key off
+    // the SELECTED MaxK (a non-canonical hdim like 200 buckets to MaxK=256 -> kN0=64).
     const bool is_deterministic = static_cast<bool>(arg_parser.get_int("deterministic"));
-    const int kN0_bwd           = (hdim_qk == 256) ? 64 : 128;
+    const int kN0_bwd           = bwd_kN0_for(hdim_qk, hdim_v);
     const int grid_seqlen_kv_h  = is_jagged ? max_seqlen_q : phy_seqlen_kv;
     const int num_splits =
         is_deterministic ? ((grid_seqlen_kv_h + kN0_bwd - 1) / kN0_bwd) : 1;
+    // dq_acc mirrors dQ's (padded) layout, so size it with ahdim_qk (== hdim_qk when off).
     const size_t single_dq_acc_elems =
-        static_cast<size_t>(batches_for_alloc) * phy_seqlen_q * num_head * hdim_qk;
+        static_cast<size_t>(batches_for_alloc) * phy_seqlen_q * num_head * ahdim_qk;
     const size_t dq_acc_elems = single_dq_acc_elems * static_cast<size_t>(num_splits);
     ck_tile::DeviceMem dq_acc_dev(dq_acc_elems * sizeof(CompDataType));
 
@@ -323,6 +385,13 @@ bool run_no_group_hstu_bwd(const ck_tile::ArgParser& arg_parser)
     k_dev.ToDevice(k_host.data());
     v_dev.ToDevice(v_host.data());
     do_dev.ToDevice(do_host.data());
+    if(poison_pad)
+    {
+        // seed the GPU output buffers with NaN so a leaked OOB store is detectable.
+        dq_dev.ToDevice(dq_host.data());
+        dk_dev.ToDevice(dk_host.data());
+        dv_dev.ToDevice(dv_host.data());
+    }
     if(!num_targets.empty())
         num_targets_dev.ToDevice(num_targets.data());
     if(is_jagged)
@@ -509,6 +578,26 @@ bool run_no_group_hstu_bwd(const ck_tile::ArgParser& arg_parser)
         const std::vector<int>& ref_q_offsets  = is_jagged ? seq_offsets_q : empty_offsets;
         const std::vector<int>& ref_kv_offsets = is_jagged ? seq_offsets_kv : empty_offsets;
 
+        // M7c: the reference + compare run on REAL hdim. When poison_pad, extract the real
+        // head-dim columns from the padded GPU tensors; otherwise these are plain copies (the
+        // reference result is identical, so poison_pad-off behavior is unchanged).
+        auto extract_real = [&](const ck_tile::HostTensor<InOutDataType>& src, int real_hd) {
+            const int B = src.get_lengths()[0], S = src.get_lengths()[1], H = src.get_lengths()[2];
+            ck_tile::HostTensor<InOutDataType> dst(
+                std::array<ck_tile::index_t, 4>{B, S, H, real_hd});
+            for(int b = 0; b < B; ++b)
+                for(int s = 0; s < S; ++s)
+                    for(int h = 0; h < H; ++h)
+                        for(int d = 0; d < real_hd; ++d)
+                            dst(b, s, h, d) = src(b, s, h, d);
+            return dst;
+        };
+        ck_tile::HostTensor<InOutDataType> q_r  = extract_real(q_host, hdim_qk);
+        ck_tile::HostTensor<InOutDataType> k_r  = extract_real(k_host, hdim_qk);
+        ck_tile::HostTensor<InOutDataType> v_r  = extract_real(v_host, hdim_v);
+        ck_tile::HostTensor<InOutDataType> o_r  = extract_real(o_host, hdim_v);
+        ck_tile::HostTensor<InOutDataType> do_r = extract_real(do_host, hdim_v);
+
         BOOL_SWITCH_3(is_jagged, kIsJagged, use_softmax, kUseSoftmax, use_causal, kUseCausal, [&] {
             ck_tile::reference_no_group_hstu_attention_bwd<InOutDataType,
                                                            GemmAccDataType,
@@ -516,12 +605,12 @@ bool run_no_group_hstu_bwd(const ck_tile::ArgParser& arg_parser)
                                                            kIsJagged,
                                                            kUseSoftmax,
                                                            kUseCausal>::Run(is_cross_attention,
-                                                                            q_host,
-                                                                            k_host,
-                                                                            v_host,
+                                                                            q_r,
+                                                                            k_r,
+                                                                            v_r,
                                                                             lse_host,
-                                                                            o_host,
-                                                                            do_host,
+                                                                            o_r,
+                                                                            do_r,
                                                                             dq_host_ref,
                                                                             dk_host_ref,
                                                                             dv_host_ref,
@@ -561,22 +650,55 @@ bool run_no_group_hstu_bwd(const ck_tile::ArgParser& arg_parser)
                       << " mean_abs_err=" << (n ? sum_abs / n : 0.0)
                       << " (max|ref|=" << max_ref << ")" << std::endl;
         };
-        report("dQ", dq_host, dq_host_ref);
-        report("dK", dk_host, dk_host_ref);
-        report("dV", dv_host, dv_host_ref);
+        // Compare on REAL hdim columns (extracted from the padded GPU output when poison_pad).
+        // A leaked OOB *load* poisons real columns -> NaN -> check_err FAIL (load-zero proof).
+        ck_tile::HostTensor<InOutDataType> dq_c = extract_real(dq_host, hdim_qk);
+        ck_tile::HostTensor<InOutDataType> dk_c = extract_real(dk_host, hdim_qk);
+        ck_tile::HostTensor<InOutDataType> dv_c = extract_real(dv_host, hdim_v);
+
+        report("dQ", dq_c, dq_host_ref);
+        report("dK", dk_c, dk_host_ref);
+        report("dV", dv_c, dv_host_ref);
 
         const bool dq_ok =
-            ck_tile::check_err(dq_host, dq_host_ref, std::string("dQ error"), rtol, atol);
+            ck_tile::check_err(dq_c, dq_host_ref, std::string("dQ error"), rtol, atol);
         const bool dk_ok =
-            ck_tile::check_err(dk_host, dk_host_ref, std::string("dK error"), rtol, atol);
+            ck_tile::check_err(dk_c, dk_host_ref, std::string("dK error"), rtol, atol);
         const bool dv_ok =
-            ck_tile::check_err(dv_host, dv_host_ref, std::string("dV error"), rtol, atol);
+            ck_tile::check_err(dv_c, dv_host_ref, std::string("dV error"), rtol, atol);
 
         numeric_pass = dq_ok && dk_ok && dv_ok;
 
         std::cout << "[" << (dq_ok ? "PASS" : "FAIL") << "] dQ   "
                   << "[" << (dk_ok ? "PASS" : "FAIL") << "] dK   "
                   << "[" << (dv_ok ? "PASS" : "FAIL") << "] dV" << std::endl;
+
+        // M7c store-skip proof for dK/dV: their padded output tail was pre-poisoned with NaN and
+        // is written by the Default2DEpilogue, which honors kPadHeadDim>0 and SKIPS padded
+        // columns. Any non-NaN there = a leaked OOB store (would clobber an adjacent head under
+        // exact allocation) -> hard FAIL. (dQ is intentionally EXCLUDED: it is written by the
+        // POST convert_dq kernel over the full element count, so its padded tail becomes
+        // convert(dq_acc_pad==0)==0 by design — harmless under padded alloc; dQ's real columns
+        // being correct already proves its load-zero, and GEMM4's dq_acc store-skip is covered
+        // by code audit since the over-allocation absorbs any stray write here.)
+        if(poison_pad)
+        {
+            auto pad_intact = [&](const ck_tile::HostTensor<InOutDataType>& t, int real_hd) {
+                const int B = t.get_lengths()[0], S = t.get_lengths()[1];
+                const int H = t.get_lengths()[2], D = t.get_lengths()[3];
+                for(int b = 0; b < B; ++b)
+                    for(int s = 0; s < S; ++s)
+                        for(int h = 0; h < H; ++h)
+                            for(int d = real_hd; d < D; ++d)
+                                if(!std::isnan(ck_tile::type_convert<float>(t(b, s, h, d))))
+                                    return false;
+                return true;
+            };
+            const bool sk = pad_intact(dk_host, hdim_qk) && pad_intact(dv_host, hdim_v);
+            std::cout << "[" << (sk ? "PASS" : "FAIL")
+                      << "] store-skip dK/dV (padded output tail stayed NaN)" << std::endl;
+            numeric_pass = numeric_pass && sk;
+        }
 
         if(dump_grad)
         {
@@ -704,26 +826,33 @@ bool run_group_hstu_bwd(const ck_tile::ArgParser& arg_parser, int num_group)
 
     using CompDataType = typename HstuAttentionFwdTypeConfig<InOutDataType>::CompDataType;
 
-    // ---- host tensors (packed dim0=1) ----------------------------------------
+    // ---- M7c poison-pad (group): mirror no_group. over-alloc head-dim to MaxK; reference is
+    // fed real-hdim copies. off -> ahdim==real -> byte-identical to M7b. ----
+    const bool poison_pad = static_cast<bool>(arg_parser.get_int("poison_pad"));
+    const int  sel_maxk   = bwd_selected_maxk(hdim_qk, hdim_v);
+    const int  ahdim_qk   = poison_pad ? sel_maxk : hdim_qk;
+    const int  ahdim_v    = poison_pad ? sel_maxk : hdim_v;
+
+    // ---- host tensors (packed dim0=1; head-dim = ahdim when poison_pad) -------
     ck_tile::HostTensor<InOutDataType> q_host(
-        std::array<ck_tile::index_t, 4>{batches_for_alloc, phy_seqlen_q, num_head, hdim_qk});
+        std::array<ck_tile::index_t, 4>{batches_for_alloc, phy_seqlen_q, num_head, ahdim_qk});
     ck_tile::HostTensor<InOutDataType> k_host(
-        std::array<ck_tile::index_t, 4>{batches_for_alloc, phy_seqlen_kv, num_head, hdim_qk});
+        std::array<ck_tile::index_t, 4>{batches_for_alloc, phy_seqlen_kv, num_head, ahdim_qk});
     ck_tile::HostTensor<InOutDataType> v_host(
-        std::array<ck_tile::index_t, 4>{batches_for_alloc, phy_seqlen_kv, num_head, hdim_v});
+        std::array<ck_tile::index_t, 4>{batches_for_alloc, phy_seqlen_kv, num_head, ahdim_v});
     ck_tile::HostTensor<InOutDataType> o_host( // SiLU: unused, kept for ref signature
-        std::array<ck_tile::index_t, 4>{batches_for_alloc, phy_seqlen_q, num_head, hdim_v});
+        std::array<ck_tile::index_t, 4>{batches_for_alloc, phy_seqlen_q, num_head, ahdim_v});
     ck_tile::HostTensor<InOutDataType> do_host(
-        std::array<ck_tile::index_t, 4>{batches_for_alloc, phy_seqlen_q, num_head, hdim_v});
+        std::array<ck_tile::index_t, 4>{batches_for_alloc, phy_seqlen_q, num_head, ahdim_v});
     ck_tile::HostTensor<CompDataType> lse_host(
         std::array<ck_tile::index_t, 3>{batches_for_alloc, phy_seqlen_q, num_head});
 
     ck_tile::HostTensor<InOutDataType> dq_host(
-        std::array<ck_tile::index_t, 4>{batches_for_alloc, phy_seqlen_q, num_head, hdim_qk});
+        std::array<ck_tile::index_t, 4>{batches_for_alloc, phy_seqlen_q, num_head, ahdim_qk});
     ck_tile::HostTensor<InOutDataType> dk_host(
-        std::array<ck_tile::index_t, 4>{batches_for_alloc, phy_seqlen_kv, num_head, hdim_qk});
+        std::array<ck_tile::index_t, 4>{batches_for_alloc, phy_seqlen_kv, num_head, ahdim_qk});
     ck_tile::HostTensor<InOutDataType> dv_host(
-        std::array<ck_tile::index_t, 4>{batches_for_alloc, phy_seqlen_kv, num_head, hdim_v});
+        std::array<ck_tile::index_t, 4>{batches_for_alloc, phy_seqlen_kv, num_head, ahdim_v});
     ck_tile::HostTensor<InOutDataType> dq_host_ref(
         std::array<ck_tile::index_t, 4>{batches_for_alloc, phy_seqlen_q, num_head, hdim_qk});
     ck_tile::HostTensor<InOutDataType> dk_host_ref(
@@ -746,6 +875,33 @@ bool run_group_hstu_bwd(const ck_tile::ArgParser& arg_parser, int num_group)
         ck_tile::FillUniformDistribution<InOutDataType>{-1.f, 1.f, seed + 3}(do_host);
     }
 
+    // ---- M7c poison helpers (no-ops when poison_pad off; mirror no_group) -----
+    const InOutDataType nan_v =
+        ck_tile::type_convert<InOutDataType>(std::numeric_limits<float>::quiet_NaN());
+    auto fill_pad_nan = [&](ck_tile::HostTensor<InOutDataType>& t, int real_hd) {
+        const int B = t.get_lengths()[0], S = t.get_lengths()[1];
+        const int H = t.get_lengths()[2], D = t.get_lengths()[3];
+        for(int b = 0; b < B; ++b)
+            for(int s = 0; s < S; ++s)
+                for(int h = 0; h < H; ++h)
+                    for(int d = real_hd; d < D; ++d)
+                        t(b, s, h, d) = nan_v;
+    };
+    auto fill_all_nan = [&](ck_tile::HostTensor<InOutDataType>& t) {
+        for(size_t i = 0; i < t.get_element_space_size(); ++i)
+            t.data()[i] = nan_v;
+    };
+    if(poison_pad)
+    {
+        fill_pad_nan(q_host, hdim_qk);
+        fill_pad_nan(k_host, hdim_qk);
+        fill_pad_nan(v_host, hdim_v);
+        fill_pad_nan(do_host, hdim_v);
+        fill_all_nan(dq_host);
+        fill_all_nan(dk_host);
+        fill_all_nan(dv_host);
+    }
+
     // ---- device buffers ------------------------------------------------------
     ck_tile::DeviceMem q_dev(q_host.get_element_space_size_in_bytes());
     ck_tile::DeviceMem k_dev(k_host.get_element_space_size_in_bytes());
@@ -765,14 +921,15 @@ bool run_group_hstu_bwd(const ck_tile::ArgParser& arg_parser, int num_group)
                                                        sizeof(int));
 
     // M6b group deterministic: dq_acc workspace = single packed slot × num_splits (one slot
-    // per KV-block, no atomic) -> POST reduces over splits. atomic: 1 slot. kN0 = tile bn0
-    // (hd256: 64, else 128) — must match the dispatch's Pipeline::kN0 (M7b).
+    // per KV-block, no atomic) -> POST reduces over splits. atomic: 1 slot. kN0 = SELECTED
+    // tile bn0 (M7c: keyed off MaxK, not raw hdim) — must match the dispatch's Pipeline::kN0.
     const bool is_deterministic    = static_cast<bool>(arg_parser.get_int("deterministic"));
-    const int kN0_bwd              = (hdim_qk == 256) ? 64 : 128;
+    const int kN0_bwd              = bwd_kN0_for(hdim_qk, hdim_v);
     const int num_splits =
         is_deterministic ? ((max_max_seqlen_q + kN0_bwd - 1) / kN0_bwd) : 1;
+    // dq_acc mirrors dQ's (padded) layout, so size it with ahdim_qk (== hdim_qk when off).
     const size_t single_dq_acc_elems =
-        static_cast<size_t>(batches_for_alloc) * phy_seqlen_q * num_head * hdim_qk;
+        static_cast<size_t>(batches_for_alloc) * phy_seqlen_q * num_head * ahdim_qk;
     const size_t dq_acc_elems = single_dq_acc_elems * static_cast<size_t>(num_splits);
     ck_tile::DeviceMem dq_acc_dev(dq_acc_elems * sizeof(CompDataType));
 
@@ -788,6 +945,12 @@ bool run_group_hstu_bwd(const ck_tile::ArgParser& arg_parser, int num_group)
     k_dev.ToDevice(k_host.data());
     v_dev.ToDevice(v_host.data());
     do_dev.ToDevice(do_host.data());
+    if(poison_pad)
+    {
+        dq_dev.ToDevice(dq_host.data());
+        dk_dev.ToDevice(dk_host.data());
+        dv_dev.ToDevice(dv_host.data());
+    }
     if(!num_targets.empty())
         num_targets_dev.ToDevice(num_targets.data());
     seq_offsets_q_dev.ToDevice(seq_offsets_q.data());
@@ -951,18 +1114,36 @@ bool run_group_hstu_bwd(const ck_tile::ArgParser& arg_parser, int num_group)
     {
         using GemmAccDataType = typename HstuAttentionFwdTypeConfig<InOutDataType>::GemmAccDataType;
 
+        // M7c: reference + compare run on REAL hdim (extract from padded GPU tensors).
+        auto extract_real = [&](const ck_tile::HostTensor<InOutDataType>& src, int real_hd) {
+            const int B = src.get_lengths()[0], S = src.get_lengths()[1], H = src.get_lengths()[2];
+            ck_tile::HostTensor<InOutDataType> dst(
+                std::array<ck_tile::index_t, 4>{B, S, H, real_hd});
+            for(int b = 0; b < B; ++b)
+                for(int s = 0; s < S; ++s)
+                    for(int h = 0; h < H; ++h)
+                        for(int d = 0; d < real_hd; ++d)
+                            dst(b, s, h, d) = src(b, s, h, d);
+            return dst;
+        };
+        ck_tile::HostTensor<InOutDataType> q_r  = extract_real(q_host, hdim_qk);
+        ck_tile::HostTensor<InOutDataType> k_r  = extract_real(k_host, hdim_qk);
+        ck_tile::HostTensor<InOutDataType> v_r  = extract_real(v_host, hdim_v);
+        ck_tile::HostTensor<InOutDataType> o_r  = extract_real(o_host, hdim_v);
+        ck_tile::HostTensor<InOutDataType> do_r = extract_real(do_host, hdim_v);
+
         BOOL_SWITCH_2(use_softmax, kUseSoftmax, use_causal, kUseCausal, [&] {
             ck_tile::reference_group_hstu_attention_bwd<InOutDataType,
                                                         GemmAccDataType,
                                                         CompDataType,
                                                         kUseSoftmax,
                                                         kUseCausal>::Run(is_cross_attention,
-                                                                         q_host,
-                                                                         k_host,
-                                                                         v_host,
+                                                                         q_r,
+                                                                         k_r,
+                                                                         v_r,
                                                                          lse_host,
-                                                                         o_host,
-                                                                         do_host,
+                                                                         o_r,
+                                                                         do_r,
                                                                          dq_host_ref,
                                                                          dk_host_ref,
                                                                          dv_host_ref,
@@ -999,17 +1180,41 @@ bool run_group_hstu_bwd(const ck_tile::ArgParser& arg_parser, int num_group)
                       << " mean_abs_err=" << (n ? sum_abs / n : 0.0)
                       << " (max|ref|=" << max_ref << ")" << std::endl;
         };
-        report("dQ", dq_host, dq_host_ref);
-        report("dK", dk_host, dk_host_ref);
-        report("dV", dv_host, dv_host_ref);
+        ck_tile::HostTensor<InOutDataType> dq_c = extract_real(dq_host, hdim_qk);
+        ck_tile::HostTensor<InOutDataType> dk_c = extract_real(dk_host, hdim_qk);
+        ck_tile::HostTensor<InOutDataType> dv_c = extract_real(dv_host, hdim_v);
+
+        report("dQ", dq_c, dq_host_ref);
+        report("dK", dk_c, dk_host_ref);
+        report("dV", dv_c, dv_host_ref);
 
         const bool dq_ok =
-            ck_tile::check_err(dq_host, dq_host_ref, std::string("dQ error"), rtol, atol);
+            ck_tile::check_err(dq_c, dq_host_ref, std::string("dQ error"), rtol, atol);
         const bool dk_ok =
-            ck_tile::check_err(dk_host, dk_host_ref, std::string("dK error"), rtol, atol);
+            ck_tile::check_err(dk_c, dk_host_ref, std::string("dK error"), rtol, atol);
         const bool dv_ok =
-            ck_tile::check_err(dv_host, dv_host_ref, std::string("dV error"), rtol, atol);
+            ck_tile::check_err(dv_c, dv_host_ref, std::string("dV error"), rtol, atol);
         numeric_pass = dq_ok && dk_ok && dv_ok;
+
+        // M7c group store-skip proof for dK/dV (same rationale as no_group; dQ excluded).
+        if(poison_pad)
+        {
+            auto pad_intact = [&](const ck_tile::HostTensor<InOutDataType>& t, int real_hd) {
+                const int B = t.get_lengths()[0], S = t.get_lengths()[1];
+                const int H = t.get_lengths()[2], D = t.get_lengths()[3];
+                for(int b = 0; b < B; ++b)
+                    for(int s = 0; s < S; ++s)
+                        for(int h = 0; h < H; ++h)
+                            for(int d = real_hd; d < D; ++d)
+                                if(!std::isnan(ck_tile::type_convert<float>(t(b, s, h, d))))
+                                    return false;
+                return true;
+            };
+            const bool sk = pad_intact(dk_host, hdim_qk) && pad_intact(dv_host, hdim_v);
+            std::cout << "[" << (sk ? "PASS" : "FAIL")
+                      << "] store-skip dK/dV (padded output tail stayed NaN)" << std::endl;
+            numeric_pass = numeric_pass && sk;
+        }
 
         std::cout << "[" << (dq_ok ? "PASS" : "FAIL") << "] dQ   "
                   << "[" << (dk_ok ? "PASS" : "FAIL") << "] dK   "

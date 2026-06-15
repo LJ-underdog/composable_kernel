@@ -40,6 +40,12 @@ struct HstuBwdShape<64>
     using WarpTile0     = ck_tile::sequence<16, 16, 32>;
     using WarpTile1     = ck_tile::sequence<16, 16, 16>;
 
+    // M7c: tile head-dim (bhdq/bhdv, square == MaxK) for the pad modulo predicate, and
+    // kN0 (bn0, k-seqlen block) for the harness determ workspace sizing.
+    static constexpr ck_tile::index_t kN0        = 128;
+    static constexpr ck_tile::index_t kQKHeaddim = 64;
+    static constexpr ck_tile::index_t kVHeaddim  = 64;
+
     using Type = ck_tile::TileFmhaBwdShape<FmhaBlockTile,
                                            BlockWarps0,
                                            WarpTile0,
@@ -65,6 +71,10 @@ struct HstuBwdShape<96>
     using WarpTile0     = ck_tile::sequence<16, 16, 32>;
     using WarpTile1     = ck_tile::sequence<16, 16, 16>;
 
+    static constexpr ck_tile::index_t kN0        = 128;
+    static constexpr ck_tile::index_t kQKHeaddim = 96;
+    static constexpr ck_tile::index_t kVHeaddim  = 96;
+
     using Type = ck_tile::TileFmhaBwdShape<FmhaBlockTile,
                                            BlockWarps0,
                                            WarpTile0,
@@ -89,6 +99,10 @@ struct HstuBwdShape<128>
     using BlockWarps2   = ck_tile::sequence<1, 4, 1>;
     using WarpTile0     = ck_tile::sequence<16, 16, 32>;
     using WarpTile1     = ck_tile::sequence<16, 16, 16>;
+
+    static constexpr ck_tile::index_t kN0        = 128;
+    static constexpr ck_tile::index_t kQKHeaddim = 128;
+    static constexpr ck_tile::index_t kVHeaddim  = 128;
 
     using Type = ck_tile::TileFmhaBwdShape<FmhaBlockTile,
                                            BlockWarps0,
@@ -117,6 +131,12 @@ struct HstuBwdShape<256>
     using BlockWarps2   = ck_tile::sequence<1, 4, 1>;
     using WarpTile0     = ck_tile::sequence<16, 16, 32>;
     using WarpTile1     = ck_tile::sequence<16, 16, 16>;
+
+    // NOTE kN0=64 (bn0) — half the other presets -> determ split count doubles; harness
+    // kN0_bwd must read this (not a hardcoded 128) or the dq_acc workspace under-allocates.
+    static constexpr ck_tile::index_t kN0        = 64;
+    static constexpr ck_tile::index_t kQKHeaddim = 256;
+    static constexpr ck_tile::index_t kVHeaddim  = 256;
 
     using Type = ck_tile::TileFmhaBwdShape<FmhaBlockTile,
                                            BlockWarps0,
