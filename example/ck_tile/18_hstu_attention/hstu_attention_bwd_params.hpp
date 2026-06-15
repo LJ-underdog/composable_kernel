@@ -107,6 +107,18 @@ struct HstuAttentionNoGroupBwdParams
 
     // ---- switch (template axis; kept as bool so host can pick instance) ------
     bool kIsDeterministic;
+
+    // ---- M8 MI: per-kernel perf (HOST-ONLY; NOT passed to MakeKargs) ---------
+    // measure_perf gates a hipEvent timing path in the dispatch. When false the
+    // dispatch runs each kernel exactly once (byte-identical device code + host
+    // behavior). When true the dispatch fills the perf_*_ms outputs (mean per-launch
+    // ms over warmup+repeat). These never reach the device, so device symbols are
+    // byte-identical to a build without MI.
+    bool measure_perf      = false;
+    float perf_pre_ms      = 0.f; // PRE dot_do_o (softmax only; 0 on SiLU)
+    float perf_memset_ms   = 0.f; // ZERO_dq_acc memset
+    float perf_main_ms     = 0.f; // MAIN dqdkdv (bottleneck; B2/B3 target)
+    float perf_post_ms     = 0.f; // POST convert_dq / reduce_convert_dq
 };
 
 // Group bwd params (DESIGN §4.6 group row, §4.7 D6). M4.
@@ -194,4 +206,11 @@ struct HstuAttentionGroupBwdParams
     int num_splits;                       // determ: ceil(max_seqlen_q/kN0); atomic: 1
 
     bool kIsDeterministic; // M6
+
+    // ---- M8 MI: per-kernel perf (HOST-ONLY; NOT passed to MakeKargs; see NoGroup) ----
+    bool measure_perf      = false;
+    float perf_pre_ms      = 0.f;
+    float perf_memset_ms   = 0.f;
+    float perf_main_ms     = 0.f;
+    float perf_post_ms     = 0.f;
 };
