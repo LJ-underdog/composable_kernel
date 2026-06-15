@@ -116,6 +116,8 @@ auto create_args(int argc, char* argv[])
         .insert("hdim_qk", "64", "headdim size of Q/K")
         .insert("hdim_v", "64", "headdim size of V/O")
         .insert("seqlens", "128", "uih seqlen for query tensor (batched: single value; jagged: comma list, supplemented to num_batch)")
+        .insert("seqlens_kv", "", "cross-attention: uih seqlen for K/V tensor (same format as -seqlens). Empty = self (kv aliases q). Given and != seqlens = cross. target_in_kv==false (KV has contextual, no targets)")
+        .insert("max_seqlen_kv", "0", "cross-attention: max uih seqlen_kv override; 0 = derive. If set must be >= max of all uih seqlen_kv")
         .insert("jagged", "0", "variable-length (jagged) packed mode: q/k/v/dO/dQ/dK/dV are [1, sum(seqlen), h, d] with cu_seqlens offsets")
         .insert("softmax", "0", "use softmax activation (M0: SiLU only, 0)")
         .insert("causal", "0", "enable causal mask (M0: no-mask, 0)")
@@ -135,6 +137,7 @@ auto create_args(int argc, char* argv[])
         // group mode (M4): num_group>1 enables group HSTU (packed + per-group hyper-params)
         .insert("g", "1", "num attention groups; >1 enables group HSTU (num_batch must be a multiple)")
         .insert("g_max_seqlens", "0", "per-group max uih seqlen (comma list); 0 = derive from seqlens")
+        .insert("g_max_seqlens_kv", "0", "cross-attention (group): per-group max uih seqlen_kv (comma list); 0 = derive from seqlens_kv")
         .insert("g_local_lens", "0", "per-group diagonal window length (comma list); 0 disables")
         .insert("g_context_lens", "0", "per-group contextual seqlen (comma list)")
         .insert("g_minfull_lens", "0", "per-group min full-attn seqlen (comma list)")
@@ -197,16 +200,32 @@ bool run_no_group_hstu_bwd(const ck_tile::ArgParser& arg_parser)
 
     std::vector<int> num_targets = get_integers_from_string(arg_parser.get_str("targets"));
     std::vector<int> seq_lengths_q = get_integers_from_string(arg_parser.get_str("seqlens"));
+    // cross-attention: -seqlens_kv (uih seqlen for K/V). Empty -> alias seqlens (self,
+    // byte-identical, backward compatible). Given and != seqlens -> cross. (mirrors fwd
+    // harness :262-345; target_in_kv == false so KV carries contextual but no targets.)
+    std::vector<int> seq_lengths_kv = get_integers_from_string(arg_parser.get_str("seqlens_kv"));
+    int input_max_uih_seqlen_kv     = arg_parser.get_int("max_seqlen_kv");
 
     HSTU_CHECK(!seq_lengths_q.empty(), "sequence lengths of q should be defined!");
     if(!is_jagged)
         HSTU_CHECK(seq_lengths_q.size() == 1, "batched harness expects a single seqlen value!");
 
-    const bool is_cross_attention = false; // M3: self-attention only
+    bool is_cross_attention = false;
+    if(seq_lengths_kv.empty())
+        seq_lengths_kv = seq_lengths_q;
+    else if(seq_lengths_kv != seq_lengths_q)
+        is_cross_attention = true;
+    else
+        seq_lengths_kv = seq_lengths_q; // explicit but equal -> self
+    if(!is_jagged)
+        HSTU_CHECK(seq_lengths_kv.size() == 1, "batched harness expects a single seqlen_kv value!");
 
     // jagged accepts a per-batch comma list; supplement to num_batch (mirrors fwd harness)
     if(is_jagged)
+    {
         supplement_array_by_last_element(seq_lengths_q, num_batch);
+        supplement_array_by_last_element(seq_lengths_kv, num_batch);
+    }
 
     int max_target = 0;
     if(!num_targets.empty())
@@ -217,38 +236,58 @@ bool run_no_group_hstu_bwd(const ck_tile::ArgParser& arg_parser)
             max_target = std::max(max_target, num_targets[i]);
     }
 
-    // max uih seqlen over batches (== seq_lengths_q[0] in batched mode)
-    int max_uih_seqlen_q = 0;
+    // max uih seqlen over batches (== seq_lengths_*[0] in batched mode)
+    int max_uih_seqlen_q  = 0;
+    int max_uih_seqlen_kv = 0;
     for(int i = 0; i < (is_jagged ? num_batch : 1); i++)
-        max_uih_seqlen_q = std::max(max_uih_seqlen_q, seq_lengths_q[i]);
+    {
+        max_uih_seqlen_q  = std::max(max_uih_seqlen_q, seq_lengths_q[i]);
+        max_uih_seqlen_kv = std::max(max_uih_seqlen_kv, seq_lengths_kv[i]);
+    }
+    // optional over-provision of the KV grid extent (mirrors fwd -max_seqlen_kv :329/:338)
+    if(input_max_uih_seqlen_kv > 0)
+    {
+        HSTU_CHECK(input_max_uih_seqlen_kv >= max_uih_seqlen_kv,
+                   "-max_seqlen_kv must be >= the maximum uih seqlen_kv");
+        max_uih_seqlen_kv = input_max_uih_seqlen_kv;
+    }
 
     // max_seqlen_q drives scale_p (=1/max_seqlen_q) identically on GPU and reference.
-    const int max_seqlen_q  = max_uih_seqlen_q + max_target + contextual_seqlen;
-    const int max_seqlen_kv = max_seqlen_q; // self-attention
+    const int max_seqlen_q = max_uih_seqlen_q + max_target + contextual_seqlen;
+    // bwd is KV-block-parallel -> max_seqlen_kv sizes the grid/num_splits. target_in_kv ==
+    // false: cross KV has contextual but no targets. self: == max_seqlen_q (byte-identical).
+    const int max_seqlen_kv = is_cross_attention ? max_uih_seqlen_kv + contextual_seqlen
+                                                 : max_seqlen_q;
 
-    // Build jagged cu_seqlens offsets (token-major packed). Self-attention: kv == q.
-    // Per-batch physical seqlen includes num_target + contextual (mirrors fwd harness).
+    // Build jagged cu_seqlens offsets (token-major packed). Per-batch physical Q seqlen
+    // includes num_target + contextual; cross KV includes contextual only (no targets). For
+    // self, the kv offsets mirror q exactly (numerically identical to the pre-cross path).
     std::vector<int> seq_offsets_q;
+    std::vector<int> seq_offsets_kv;
     int phy_seqlen_q  = 0;
     int phy_seqlen_kv = 0;
     if(is_jagged)
     {
         seq_offsets_q.push_back(0);
+        seq_offsets_kv.push_back(0);
         for(int i = 0; i < num_batch; i++)
         {
-            const int batch_seqlen = seq_lengths_q[i] +
-                                     (num_targets.empty() ? 0 : num_targets[i]) + contextual_seqlen;
-            phy_seqlen_q += batch_seqlen;
+            const int batch_seqlen_q = seq_lengths_q[i] +
+                                       (num_targets.empty() ? 0 : num_targets[i]) + contextual_seqlen;
+            phy_seqlen_q += batch_seqlen_q;
             seq_offsets_q.push_back(phy_seqlen_q);
+
+            const int batch_seqlen_kv =
+                is_cross_attention ? seq_lengths_kv[i] + contextual_seqlen : batch_seqlen_q;
+            phy_seqlen_kv += batch_seqlen_kv;
+            seq_offsets_kv.push_back(phy_seqlen_kv);
         }
-        phy_seqlen_kv = phy_seqlen_q; // self-attention
     }
     else
     {
         phy_seqlen_q  = max_seqlen_q;
         phy_seqlen_kv = max_seqlen_kv;
     }
-    const std::vector<int>& seq_offsets_kv = seq_offsets_q; // self-attention
 
     // dim0 of the packed tensors: 1 for jagged (ΣL along dim1), num_batch otherwise.
     const int batches_for_alloc = is_jagged ? 1 : num_batch;
@@ -352,8 +391,10 @@ bool run_no_group_hstu_bwd(const ck_tile::ArgParser& arg_parser)
     ck_tile::DeviceMem dv_dev(dv_host.get_element_space_size_in_bytes());
     ck_tile::DeviceMem num_targets_dev(std::max<size_t>(num_targets.size(), 1) * sizeof(int));
 
-    // jagged cu_seqlens offsets (size num_batch+1); allocate >=1 elem so batched is benign
+    // jagged cu_seqlens offsets (size num_batch+1); allocate >=1 elem so batched is benign.
+    // cross-attention: K/V indexed by an INDEPENDENT kv-offset buffer (self: same contents).
     ck_tile::DeviceMem seq_offsets_q_dev(std::max<size_t>(seq_offsets_q.size(), 1) * sizeof(int));
+    ck_tile::DeviceMem seq_offsets_kv_dev(std::max<size_t>(seq_offsets_kv.size(), 1) * sizeof(int));
 
     // float dQ accumulation workspace. atomic: 1 slot (same packed layout as dQ). M6
     // deterministic: num_splits stacked slots (one per KV-block) -> POST reduces over them.
@@ -362,7 +403,9 @@ bool run_no_group_hstu_bwd(const ck_tile::ArgParser& arg_parser)
     // the SELECTED MaxK (a non-canonical hdim like 200 buckets to MaxK=256 -> kN0=64).
     const bool is_deterministic = static_cast<bool>(arg_parser.get_int("deterministic"));
     const int kN0_bwd           = bwd_kN0_for(hdim_qk, hdim_v);
-    const int grid_seqlen_kv_h  = is_jagged ? max_seqlen_q : phy_seqlen_kv;
+    // bwd is KV-block-parallel: the dq_acc determ workspace must size by the KV grid extent.
+    // cross self path: max_seqlen_kv == max_seqlen_q -> unchanged.
+    const int grid_seqlen_kv_h  = is_jagged ? max_seqlen_kv : phy_seqlen_kv;
     const int num_splits =
         is_deterministic ? ((grid_seqlen_kv_h + kN0_bwd - 1) / kN0_bwd) : 1;
     // dq_acc mirrors dQ's (padded) layout, so size it with ahdim_qk (== hdim_qk when off).
@@ -395,7 +438,10 @@ bool run_no_group_hstu_bwd(const ck_tile::ArgParser& arg_parser)
     if(!num_targets.empty())
         num_targets_dev.ToDevice(num_targets.data());
     if(is_jagged)
+    {
         seq_offsets_q_dev.ToDevice(seq_offsets_q.data());
+        seq_offsets_kv_dev.ToDevice(seq_offsets_kv.data());
+    }
 
     const float scale_s = (in_alpha != 0.f) ? in_alpha : 1.0f / std::sqrt(static_cast<float>(hdim_qk));
 
@@ -411,7 +457,7 @@ bool run_no_group_hstu_bwd(const ck_tile::ArgParser& arg_parser)
         fp.seqlen_q           = phy_seqlen_q;  // jagged: ignored (per-batch via offsets)
         fp.seqlen_kv          = phy_seqlen_kv; // jagged: ignored
         fp.seq_q_offsets_ptr  = is_jagged ? seq_offsets_q_dev.GetDeviceBuffer() : nullptr;
-        fp.seq_kv_offsets_ptr = is_jagged ? seq_offsets_q_dev.GetDeviceBuffer() : nullptr;
+        fp.seq_kv_offsets_ptr = is_jagged ? seq_offsets_kv_dev.GetDeviceBuffer() : nullptr;
         fp.max_seqlen_q       = max_seqlen_q;
         fp.q_ptr              = q_dev.GetDeviceBuffer();
         fp.k_ptr              = k_dev.GetDeviceBuffer();
@@ -489,8 +535,9 @@ bool run_no_group_hstu_bwd(const ck_tile::ArgParser& arg_parser)
         bp.seqlen_q           = phy_seqlen_q;  // jagged: ignored (per-batch via offsets)
         bp.seqlen_kv          = phy_seqlen_kv; // jagged: ignored
         bp.seq_q_offsets_ptr  = is_jagged ? seq_offsets_q_dev.GetDeviceBuffer() : nullptr;
-        bp.seq_kv_offsets_ptr = is_jagged ? seq_offsets_q_dev.GetDeviceBuffer() : nullptr;
+        bp.seq_kv_offsets_ptr = is_jagged ? seq_offsets_kv_dev.GetDeviceBuffer() : nullptr;
         bp.max_seqlen_q       = max_seqlen_q; // scale_p = attn_scale ? attn_scale : 1/max_seqlen_q
+        bp.max_seqlen_kv      = max_seqlen_kv; // cross KV grid sizing (self: == max_seqlen_q)
         bp.q_ptr              = q_dev.GetDeviceBuffer();
         bp.k_ptr              = k_dev.GetDeviceBuffer();
         bp.v_ptr              = v_dev.GetDeviceBuffer();
@@ -746,12 +793,22 @@ bool run_group_hstu_bwd(const ck_tile::ArgParser& arg_parser, int num_group)
     HSTU_CHECK(num_batch > 0 && num_batch % num_group == 0,
                "number of batches should be a multiple of num_group!");
     const int num_batch_per_group = num_batch / num_group;
-    const bool is_cross_attention = false; // M4: self-attention only
-
     std::vector<int> num_targets   = get_integers_from_string(arg_parser.get_str("targets"));
     std::vector<int> seq_lengths_q = get_integers_from_string(arg_parser.get_str("seqlens"));
     HSTU_CHECK(!seq_lengths_q.empty(), "sequence lengths of q should be defined!");
+    // cross-attention: -seqlens_kv (uih seqlen for K/V). Empty -> alias seqlens (self,
+    // byte-identical). Given and != seqlens -> cross (target_in_kv==false; KV has contextual,
+    // no targets). Compare BEFORE supplementing so the raw lists decide self vs cross.
+    std::vector<int> seq_lengths_kv = get_integers_from_string(arg_parser.get_str("seqlens_kv"));
+    bool is_cross_attention = false;
+    if(seq_lengths_kv.empty())
+        seq_lengths_kv = seq_lengths_q;
+    else if(seq_lengths_kv != seq_lengths_q)
+        is_cross_attention = true;
+    else
+        seq_lengths_kv = seq_lengths_q; // explicit but equal -> self
     supplement_array_by_last_element(seq_lengths_q, num_batch);
+    supplement_array_by_last_element(seq_lengths_kv, num_batch);
     if(!num_targets.empty())
         supplement_array_by_last_element(num_targets, num_batch);
 
@@ -764,7 +821,11 @@ bool run_group_hstu_bwd(const ck_tile::ArgParser& arg_parser, int num_group)
     std::vector<int> group_min_full_attn_seqlens =
         get_integers_from_string(arg_parser.get_str("g_minfull_lens"));
     std::vector<float> group_attn_scales = get_floats_from_string(arg_parser.get_str("g_attn_scales"));
+    // cross-attention (group): per-group KV uih cap override (symmetric to g_max_seqlens)
+    std::vector<int> group_input_max_uih_seqlens_kv =
+        get_integers_from_string(arg_parser.get_str("g_max_seqlens_kv"));
     supplement_array_by_last_element(group_input_max_uih_seqlens_q, num_group);
+    supplement_array_by_last_element(group_input_max_uih_seqlens_kv, num_group);
     supplement_array_by_last_element(group_window_sizes, num_group);
     supplement_array_by_last_element(group_contextual_seqlens, num_group);
     supplement_array_by_last_element(group_min_full_attn_seqlens, num_group);
@@ -801,10 +862,39 @@ bool run_group_hstu_bwd(const ck_tile::ArgParser& arg_parser, int num_group)
         max_max_seqlen_q = std::max(max_max_seqlen_q, group_max_seqlens_q[i_grp]);
     }
 
-    // cu_seqlens (token-major packed); self-attention -> kv == q
+    // cross-attention KV per-group max (symmetric to group_max_seqlens_q; target_in_kv==false
+    // -> KV carries contextual but no targets). self: kv mirrors q -> identical to q maxima.
+    std::vector<int> group_max_seqlens_kv(num_group, 0);
+    int max_max_seqlen_kv = 0;
+    for(int i_grp = 0; i_grp < num_group; i_grp++)
+    {
+        if(!is_cross_attention)
+        {
+            group_max_seqlens_kv[i_grp] = group_max_seqlens_q[i_grp];
+        }
+        else
+        {
+            int grp_max_uih_kv = 0;
+            for(int i = 0; i < num_batch_per_group; i++)
+            {
+                const int b   = i_grp * num_batch_per_group + i;
+                grp_max_uih_kv = std::max(grp_max_uih_kv, seq_lengths_kv[b]);
+            }
+            if(group_input_max_uih_seqlens_kv[i_grp] > 0)
+                grp_max_uih_kv = std::max(grp_max_uih_kv, group_input_max_uih_seqlens_kv[i_grp]);
+            group_max_seqlens_kv[i_grp] = grp_max_uih_kv + group_contextual_seqlens[i_grp];
+        }
+        max_max_seqlen_kv = std::max(max_max_seqlen_kv, group_max_seqlens_kv[i_grp]);
+    }
+
+    // cu_seqlens (token-major packed). Q includes num_target + contextual; cross KV includes
+    // contextual only (target_in_kv==false). self: kv offsets mirror q exactly.
     std::vector<int> seq_offsets_q;
+    std::vector<int> seq_offsets_kv;
     seq_offsets_q.push_back(0);
-    int phy_seqlen_q = 0;
+    seq_offsets_kv.push_back(0);
+    int phy_seqlen_q  = 0;
+    int phy_seqlen_kv = 0;
     for(int i = 0; i < num_batch; i++)
     {
         const int i_group = i / num_batch_per_group;
@@ -819,10 +909,15 @@ bool run_group_hstu_bwd(const ck_tile::ArgParser& arg_parser, int num_group)
         HSTU_CHECK(max_max_seqlen_q >= batch_seqlen,
                    "group max_seqlen_q under-covers a batch's packed seqlen (group_max_seqlens_q "
                    "computed too small)");
+
+        const int batch_seqlen_kv =
+            is_cross_attention ? seq_lengths_kv[i] + group_contextual_seqlens[i_group] : batch_seqlen;
+        phy_seqlen_kv += batch_seqlen_kv;
+        seq_offsets_kv.push_back(phy_seqlen_kv);
+        HSTU_CHECK(max_max_seqlen_kv >= batch_seqlen_kv,
+                   "group max_seqlen_kv under-covers a batch's packed kv seqlen");
     }
-    const int phy_seqlen_kv                = phy_seqlen_q;
-    const std::vector<int>& seq_offsets_kv = seq_offsets_q;
-    const int batches_for_alloc            = 1;
+    const int batches_for_alloc = 1;
 
     using CompDataType = typename HstuAttentionFwdTypeConfig<InOutDataType>::CompDataType;
 
@@ -912,6 +1007,8 @@ bool run_group_hstu_bwd(const ck_tile::ArgParser& arg_parser, int num_group)
     ck_tile::DeviceMem dv_dev(dv_host.get_element_space_size_in_bytes());
     ck_tile::DeviceMem num_targets_dev(std::max<size_t>(num_targets.size(), 1) * sizeof(int));
     ck_tile::DeviceMem seq_offsets_q_dev(seq_offsets_q.size() * sizeof(int));
+    // cross-attention: K/V indexed by an INDEPENDENT kv-offset buffer (self: same contents).
+    ck_tile::DeviceMem seq_offsets_kv_dev(seq_offsets_kv.size() * sizeof(int));
 
     ck_tile::DeviceMem group_attn_scales_dev(group_attn_scales.size() * sizeof(float));
     ck_tile::DeviceMem group_max_seqlens_q_dev(group_max_seqlens_q.size() * sizeof(int));
@@ -925,8 +1022,9 @@ bool run_group_hstu_bwd(const ck_tile::ArgParser& arg_parser, int num_group)
     // tile bn0 (M7c: keyed off MaxK, not raw hdim) — must match the dispatch's Pipeline::kN0.
     const bool is_deterministic    = static_cast<bool>(arg_parser.get_int("deterministic"));
     const int kN0_bwd              = bwd_kN0_for(hdim_qk, hdim_v);
+    // bwd is KV-block-parallel -> determ workspace sizes by the KV grid extent (self: == q).
     const int num_splits =
-        is_deterministic ? ((max_max_seqlen_q + kN0_bwd - 1) / kN0_bwd) : 1;
+        is_deterministic ? ((max_max_seqlen_kv + kN0_bwd - 1) / kN0_bwd) : 1;
     // dq_acc mirrors dQ's (padded) layout, so size it with ahdim_qk (== hdim_qk when off).
     const size_t single_dq_acc_elems =
         static_cast<size_t>(batches_for_alloc) * phy_seqlen_q * num_head * ahdim_qk;
@@ -954,6 +1052,7 @@ bool run_group_hstu_bwd(const ck_tile::ArgParser& arg_parser, int num_group)
     if(!num_targets.empty())
         num_targets_dev.ToDevice(num_targets.data());
     seq_offsets_q_dev.ToDevice(seq_offsets_q.data());
+    seq_offsets_kv_dev.ToDevice(seq_offsets_kv.data());
     group_attn_scales_dev.ToDevice(group_attn_scales.data());
     group_max_seqlens_q_dev.ToDevice(group_max_seqlens_q.data());
     group_window_sizes_dev.ToDevice(group_window_sizes.data());
@@ -978,7 +1077,7 @@ bool run_group_hstu_bwd(const ck_tile::ArgParser& arg_parser, int num_group)
         fp.num_group          = num_group;
         fp.num_batch          = num_batch;
         fp.seq_q_offsets_ptr  = seq_offsets_q_dev.GetDeviceBuffer();
-        fp.seq_kv_offsets_ptr = seq_offsets_q_dev.GetDeviceBuffer();
+        fp.seq_kv_offsets_ptr = seq_offsets_kv_dev.GetDeviceBuffer();
         fp.max_seqlen_q       = max_max_seqlen_q;
         fp.q_ptr              = q_dev.GetDeviceBuffer();
         fp.k_ptr              = k_dev.GetDeviceBuffer();
@@ -1038,8 +1137,9 @@ bool run_group_hstu_bwd(const ck_tile::ArgParser& arg_parser, int num_group)
         bp.num_group          = num_group;
         bp.num_batch          = num_batch;
         bp.seq_q_offsets_ptr  = seq_offsets_q_dev.GetDeviceBuffer();
-        bp.seq_kv_offsets_ptr = seq_offsets_q_dev.GetDeviceBuffer();
+        bp.seq_kv_offsets_ptr = seq_offsets_kv_dev.GetDeviceBuffer();
         bp.max_seqlen_q       = max_max_seqlen_q;
+        bp.max_seqlen_kv      = max_max_seqlen_kv; // cross KV grid sizing (self: == max_seqlen_q)
         bp.q_ptr              = q_dev.GetDeviceBuffer();
         bp.k_ptr              = k_dev.GetDeviceBuffer();
         bp.v_ptr              = v_dev.GetDeviceBuffer();

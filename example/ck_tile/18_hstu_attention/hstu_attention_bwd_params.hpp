@@ -29,6 +29,9 @@ struct HstuAttentionNoGroupBwdParams
     const void* seq_q_offsets_ptr;  // jagged mode only
     const void* seq_kv_offsets_ptr; // jagged mode only
     ck_tile::index_t max_seqlen_q;  // jagged mode only
+    // cross-attention KV grid sizing (bwd is KV-block-parallel). self path: caller sets
+    // max_seqlen_kv == max_seqlen_q -> grid/num_splits unchanged -> byte-identical.
+    ck_tile::index_t max_seqlen_kv; // jagged mode only
 
     const void* q_ptr;
     const void* k_ptr;
@@ -122,6 +125,9 @@ struct HstuAttentionGroupBwdParams
     const void* seq_q_offsets_ptr;  // int32, size num_batch+1 (token-major packed)
     const void* seq_kv_offsets_ptr; // int32, size num_batch+1
     ck_tile::index_t max_seqlen_q;  // max over all groups' max_seqlen_q (grid sizing)
+    // cross-attention KV grid sizing (bwd is KV-block-parallel; max over all groups'
+    // max_seqlen_kv). self path: caller sets == max_seqlen_q -> byte-identical.
+    ck_tile::index_t max_seqlen_kv;
 
     const void* q_ptr;
     const void* k_ptr;

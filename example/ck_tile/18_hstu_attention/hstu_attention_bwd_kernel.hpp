@@ -401,18 +401,43 @@ struct HstuAttentionBwdDQDKDVKernel
                     (kargs.seqlen_q - num_target > kargs.min_full_attn_seqlen)
                         ? kargs.min_full_attn_seqlen
                         : (kargs.seqlen_q - num_target);
-                return make_hstu_self_attention_block_mask_with_local<FmhaMask>(
-                    /*is_tile_in_first_split=*/true,
-                    kargs.seqlen_q,
-                    kargs.contextual_seqlen,
-                    num_target,
-                    kargs.max_attn_len,
-                    eff_min_full);
+                // cross-attention: feed seqlen_kv into the seqlen_k slot (must go through the
+                // make_hstu_cross_attention_* wrapper -> correct ctor arg order, see draft R2/R3).
+                // if constexpr so the self (false) leg dead-code-elims byte-identical to M7c.
+                if constexpr(FmhaMask::kIsCrossAttention)
+                {
+                    return make_hstu_cross_attention_block_mask_with_local<FmhaMask>(
+                        /*is_tile_in_first_split=*/true,
+                        kargs.seqlen_q,
+                        kargs.seqlen_kv,
+                        kargs.contextual_seqlen,
+                        num_target,
+                        kargs.max_attn_len,
+                        eff_min_full);
+                }
+                else
+                {
+                    return make_hstu_self_attention_block_mask_with_local<FmhaMask>(
+                        /*is_tile_in_first_split=*/true,
+                        kargs.seqlen_q,
+                        kargs.contextual_seqlen,
+                        num_target,
+                        kargs.max_attn_len,
+                        eff_min_full);
+                }
             }
             else
             {
-                return make_hstu_self_attention_block_mask_without_local<FmhaMask>(
-                    kargs.seqlen_q, kargs.contextual_seqlen, num_target);
+                if constexpr(FmhaMask::kIsCrossAttention)
+                {
+                    return make_hstu_cross_attention_block_mask_without_local<FmhaMask>(
+                        kargs.seqlen_q, kargs.seqlen_kv, kargs.contextual_seqlen, num_target);
+                }
+                else
+                {
+                    return make_hstu_self_attention_block_mask_without_local<FmhaMask>(
+                        kargs.seqlen_q, kargs.contextual_seqlen, num_target);
+                }
             }
         }();
 
@@ -825,14 +850,32 @@ struct HstuAttentionBwdDQDKDVSoftmaxKernel
                     (kargs.seqlen_q - num_target > kargs.min_full_attn_seqlen)
                         ? kargs.min_full_attn_seqlen
                         : (kargs.seqlen_q - num_target);
-                return make_hstu_self_attention_block_mask_with_local<FmhaMask>(
-                    /*is_tile_in_first_split=*/true, kargs.seqlen_q, kargs.contextual_seqlen,
-                    num_target, kargs.max_attn_len, eff_min_full);
+                // cross-attention: seqlen_kv into seqlen_k slot (see SiLU site / draft R2/R3).
+                if constexpr(FmhaMask::kIsCrossAttention)
+                {
+                    return make_hstu_cross_attention_block_mask_with_local<FmhaMask>(
+                        /*is_tile_in_first_split=*/true, kargs.seqlen_q, kargs.seqlen_kv,
+                        kargs.contextual_seqlen, num_target, kargs.max_attn_len, eff_min_full);
+                }
+                else
+                {
+                    return make_hstu_self_attention_block_mask_with_local<FmhaMask>(
+                        /*is_tile_in_first_split=*/true, kargs.seqlen_q, kargs.contextual_seqlen,
+                        num_target, kargs.max_attn_len, eff_min_full);
+                }
             }
             else
             {
-                return make_hstu_self_attention_block_mask_without_local<FmhaMask>(
-                    kargs.seqlen_q, kargs.contextual_seqlen, num_target);
+                if constexpr(FmhaMask::kIsCrossAttention)
+                {
+                    return make_hstu_cross_attention_block_mask_without_local<FmhaMask>(
+                        kargs.seqlen_q, kargs.seqlen_kv, kargs.contextual_seqlen, num_target);
+                }
+                else
+                {
+                    return make_hstu_self_attention_block_mask_without_local<FmhaMask>(
+                        kargs.seqlen_q, kargs.contextual_seqlen, num_target);
+                }
             }
         }();
 
@@ -1218,9 +1261,18 @@ struct HstuAttentionBwdDQDKDVGroupKernel
             const int eff_min_full = (seqlen_q - num_target > min_full_attn_seqlen)
                                          ? min_full_attn_seqlen
                                          : (seqlen_q - num_target);
-            auto mask = make_hstu_self_attention_block_mask_with_local<LocalMask>(
-                /*is_tile_in_first_split=*/true, seqlen_q, contextual_seqlen, num_target,
-                window_size, eff_min_full);
+            // cross-attention: feed seqlen_kv into the seqlen_k slot via the cross wrapper
+            // (draft R2/R3); if constexpr keeps the self leg byte-identical to M7c.
+            auto mask = [&]() {
+                if constexpr(LocalMask::kIsCrossAttention)
+                    return make_hstu_cross_attention_block_mask_with_local<LocalMask>(
+                        /*is_tile_in_first_split=*/true, seqlen_q, seqlen_kv, contextual_seqlen,
+                        num_target, window_size, eff_min_full);
+                else
+                    return make_hstu_self_attention_block_mask_with_local<LocalMask>(
+                        /*is_tile_in_first_split=*/true, seqlen_q, contextual_seqlen, num_target,
+                        window_size, eff_min_full);
+            }();
             auto [dk_acc_tile, dv_acc_tile] =
                 PipelineLocal{}(q_dram_window, k_dram_window, v_dram_window, do_dram_window,
                                 dq_dram_window, mask, kargs.alpha, scale_p, smem_ptr);
@@ -1228,8 +1280,14 @@ struct HstuAttentionBwdDQDKDVGroupKernel
         }
         else
         {
-            auto mask = make_hstu_self_attention_block_mask_without_local<NoLocalMask>(
-                seqlen_q, contextual_seqlen, num_target);
+            auto mask = [&]() {
+                if constexpr(NoLocalMask::kIsCrossAttention)
+                    return make_hstu_cross_attention_block_mask_without_local<NoLocalMask>(
+                        seqlen_q, seqlen_kv, contextual_seqlen, num_target);
+                else
+                    return make_hstu_self_attention_block_mask_without_local<NoLocalMask>(
+                        seqlen_q, contextual_seqlen, num_target);
+            }();
             auto [dk_acc_tile, dv_acc_tile] =
                 PipelineNoLocal{}(q_dram_window, k_dram_window, v_dram_window, do_dram_window,
                                   dq_dram_window, mask, kargs.alpha, scale_p, smem_ptr);
@@ -1588,9 +1646,18 @@ struct HstuAttentionBwdDQDKDVGroupSoftmaxKernel
             const int eff_min_full = (seqlen_q - num_target > min_full_attn_seqlen)
                                          ? min_full_attn_seqlen
                                          : (seqlen_q - num_target);
-            auto mask = make_hstu_self_attention_block_mask_with_local<LocalMask>(
-                /*is_tile_in_first_split=*/true, seqlen_q, contextual_seqlen, num_target,
-                window_size, eff_min_full);
+            // cross-attention: feed seqlen_kv into the seqlen_k slot via the cross wrapper
+            // (draft R2/R3); if constexpr keeps the self leg byte-identical to M7c.
+            auto mask = [&]() {
+                if constexpr(LocalMask::kIsCrossAttention)
+                    return make_hstu_cross_attention_block_mask_with_local<LocalMask>(
+                        /*is_tile_in_first_split=*/true, seqlen_q, seqlen_kv, contextual_seqlen,
+                        num_target, window_size, eff_min_full);
+                else
+                    return make_hstu_self_attention_block_mask_with_local<LocalMask>(
+                        /*is_tile_in_first_split=*/true, seqlen_q, contextual_seqlen, num_target,
+                        window_size, eff_min_full);
+            }();
             auto [dk_acc_tile, dv_acc_tile] =
                 PipelineLocal{}(q_dram_window, k_dram_window, v_dram_window, do_dram_window,
                                 lse_dram_window, d_dram_window, dq_dram_window, mask, kargs.alpha,
@@ -1599,8 +1666,14 @@ struct HstuAttentionBwdDQDKDVGroupSoftmaxKernel
         }
         else
         {
-            auto mask = make_hstu_self_attention_block_mask_without_local<NoLocalMask>(
-                seqlen_q, contextual_seqlen, num_target);
+            auto mask = [&]() {
+                if constexpr(NoLocalMask::kIsCrossAttention)
+                    return make_hstu_cross_attention_block_mask_without_local<NoLocalMask>(
+                        seqlen_q, seqlen_kv, contextual_seqlen, num_target);
+                else
+                    return make_hstu_self_attention_block_mask_without_local<NoLocalMask>(
+                        seqlen_q, contextual_seqlen, num_target);
+            }();
             auto [dk_acc_tile, dv_acc_tile] =
                 PipelineNoLocal{}(q_dram_window, k_dram_window, v_dram_window, do_dram_window,
                                   lse_dram_window, d_dram_window, dq_dram_window, mask, kargs.alpha,
