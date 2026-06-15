@@ -21,6 +21,7 @@
 #include "hstu_attention_with_softmax_bwd_pipeline.hpp"
 #include "hstu_attention_bwd_kernel.hpp"
 #include "hstu_attention_bwd_shape.hpp"
+#include "hstu_attention_bwd_perf.hpp"
 
 // HSTU attention backward — batched NoGroup dispatch (M1: SiLU + no-mask + atomic).
 //
@@ -72,50 +73,61 @@ struct batched_backward_dispatch
                 ? static_cast<int>(ck_tile::integer_divide_ceil(grid_seqlen_kv, Pipeline::kN0))
                 : 1;
 
-        HIP_CHECK_ERROR(hipMemsetAsync(param.dq_acc_ptr,
-                                       0,
-                                       single * static_cast<size_t>(num_splits) *
-                                           sizeof(typename TC::GemmAccDataType),
-                                       stream));
+        // M8 MI: time the ZERO_dq_acc memset separately (kept out of MAIN TFLOPS).
+        param.perf_memset_ms = hstu_bwd_perf::time_op(param.measure_perf, stream, [&] {
+            HIP_CHECK_ERROR(hipMemsetAsync(param.dq_acc_ptr,
+                                           0,
+                                           single * static_cast<size_t>(num_splits) *
+                                               sizeof(typename TC::GemmAccDataType),
+                                           stream));
+        });
 
         dim3 grid  = Kernel::GridSize(param.num_batch, param.num_head, grid_seqlen_kv);
         dim3 block = Kernel::BlockSize();
         constexpr ck_tile::index_t kBlockPerCu = Kernel::kBlockPerCu;
-        (void)ck_tile::launch_kernel(
-            ck_tile::stream_config{stream, false},
-            ck_tile::make_kernel<kBlockPerCu>(Kernel{}, grid, block, 0, kargs));
+        // M8 MI: MAIN dqdkdv — the bottleneck (B2/B3 target). Inner launch keeps
+        // stream_config{stream,false}; the warmup+repeat is done by time_op.
+        param.perf_main_ms = hstu_bwd_perf::time_op(param.measure_perf, stream, [&] {
+            (void)ck_tile::launch_kernel(
+                ck_tile::stream_config{stream, false},
+                ck_tile::make_kernel<kBlockPerCu>(Kernel{}, grid, block, 0, kargs));
+        });
 
         // POST: dq_acc(float) -> dq. Determ reduces over splits (fixed order -> reproducible).
         const ck_tile::long_index_t n = static_cast<ck_tile::long_index_t>(single);
         constexpr int kPostThreads = 256;
         const int post_blocks      = static_cast<int>((n + kPostThreads - 1) / kPostThreads);
-        if constexpr(kIsDeterministic)
-        {
-            hipLaunchKernelGGL(
-                (ck_tile::hstu_bwd_reduce_convert_dq_kernel<InOutDataType,
-                                                            typename TC::GemmAccDataType>),
-                dim3(post_blocks),
-                dim3(kPostThreads),
-                0,
-                stream,
-                reinterpret_cast<const typename TC::GemmAccDataType*>(param.dq_acc_ptr),
-                reinterpret_cast<InOutDataType*>(param.dq_ptr),
-                n,
-                num_splits,
-                static_cast<ck_tile::long_index_t>(single));
-        }
-        else
-        {
-            hipLaunchKernelGGL(
-                (ck_tile::hstu_bwd_convert_dq_kernel<InOutDataType, typename TC::GemmAccDataType>),
-                dim3(post_blocks),
-                dim3(kPostThreads),
-                0,
-                stream,
-                reinterpret_cast<const typename TC::GemmAccDataType*>(param.dq_acc_ptr),
-                reinterpret_cast<InOutDataType*>(param.dq_ptr),
-                n);
-        }
+        // M8 MI: POST convert (atomic) / reduce_convert (deterministic) dq_acc->dq.
+        param.perf_post_ms = hstu_bwd_perf::time_op(param.measure_perf, stream, [&] {
+            if constexpr(kIsDeterministic)
+            {
+                hipLaunchKernelGGL(
+                    (ck_tile::hstu_bwd_reduce_convert_dq_kernel<InOutDataType,
+                                                                typename TC::GemmAccDataType>),
+                    dim3(post_blocks),
+                    dim3(kPostThreads),
+                    0,
+                    stream,
+                    reinterpret_cast<const typename TC::GemmAccDataType*>(param.dq_acc_ptr),
+                    reinterpret_cast<InOutDataType*>(param.dq_ptr),
+                    n,
+                    num_splits,
+                    static_cast<ck_tile::long_index_t>(single));
+            }
+            else
+            {
+                hipLaunchKernelGGL(
+                    (ck_tile::hstu_bwd_convert_dq_kernel<InOutDataType,
+                                                         typename TC::GemmAccDataType>),
+                    dim3(post_blocks),
+                    dim3(kPostThreads),
+                    0,
+                    stream,
+                    reinterpret_cast<const typename TC::GemmAccDataType*>(param.dq_acc_ptr),
+                    reinterpret_cast<InOutDataType*>(param.dq_ptr),
+                    n);
+            }
+        });
     }
 
     template <typename Mask, bool kPadHeadDimQ, bool kPadHeadDimV>
@@ -284,6 +296,8 @@ struct batched_backward_dispatch
                 static_cast<ck_tile::long_index_t>(param.num_batch) * param.num_head * grid_seqlen;
             constexpr int kPreThreads = 256;
             const int pre_blocks = static_cast<int>((total + kPreThreads - 1) / kPreThreads);
+            // M8 MI: time PRE D=rowsum(O*dO) (softmax path only).
+            param.perf_pre_ms = hstu_bwd_perf::time_op(param.measure_perf, stream, [&] {
             hipLaunchKernelGGL(
                 (ck_tile::hstu_bwd_dot_do_o_kernel<InOutDataType, typename TC::CompDataType>),
                 dim3(pre_blocks),
@@ -309,6 +323,7 @@ struct batched_backward_dispatch
                 static_cast<ck_tile::long_index_t>(param.batch_stride_o),
                 static_cast<ck_tile::long_index_t>(param.nhead_stride_lsed),
                 static_cast<ck_tile::long_index_t>(param.batch_stride_lsed));
+            }); // time_op (PRE)
         }
 
         auto kargs = Kernel::MakeKargs(param.q_ptr,

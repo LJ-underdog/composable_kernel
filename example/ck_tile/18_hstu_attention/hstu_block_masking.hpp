@@ -266,15 +266,64 @@ struct HstuCrossAttentionBlockMaskWithLocal
         return false;
     }
 
-    // --- bwd additions (M2, DESIGN §3.1 方案A:纯加,不改 fwd 成员) ---
-    // GetTileRangeAlongY: KV-block -> attending Q-row range (transpose of GetTileRangeAlongX).
-    // M2 returns the conservative continuous superset = full Q scan (fallback B, §8.2-R3);
-    // correctness comes from per-pixel IsTokenPairInsideMask zeroing in STAGE2. Tightening = perf.
+    // --- bwd additions (M2 full-scan; M8/B3 local/window tightening, cross) ---
+    // GetTileRangeAlongY: KV-block [i_x, i_x+XTile) -> attending Q-row range (transpose of
+    // GetTileRangeAlongX). B3 tightens the sliding-window (local) case. The window caps BOTH
+    // band edges in K-space (causal: row in [col, col+W]; non-causal: [col-W, col+W]); the
+    // cross q/k offset diff_q_kv_len shifts row<->col. target_in_kv==false so every K col is
+    // uih. Per-pixel IsTokenPairInsideMask still masks inside each visited tile, so the only
+    // requirement is a kM0(YTile)-aligned SUPERSET (offline validate_tile_range_y gate).
     template <index_t YTile, index_t XTile>
     CK_TILE_HOST_DEVICE constexpr auto
-    GetTileRangeAlongY(index_t /*i_x*/, number<YTile>, number<XTile>) const
+    GetTileRangeAlongY(index_t i_x, number<YTile>, number<XTile>) const
     {
-        return ck_tile::make_tuple(0, seqlen_q);
+        const index_t W = max_attn_len;
+        // contextual rows [0,contextual_seqlen) attend all uih cols (every K col is uih).
+        const bool ctx_rows = (contextual_seqlen > 0 && i_x < max_k_uih_len);
+        index_t y_start;
+        if(ctx_rows)
+        {
+            y_start = 0;
+        }
+        else
+        {
+            // causal lower edge = diagonal (r = col - diff); non-causal lower = col - W - diff.
+            index_t lo = kUseCausal ? (i_x - diff_q_kv_len)
+                                    : (min(i_x, max_k_uih_len) - W - diff_q_kv_len);
+            // non-causal min_full rows attend ALL cols (physical start max_q_uih_len-mf).
+            if(!kUseCausal && min_full_attn_seqlen > 0)
+            {
+                const index_t mf_lo = max_q_uih_len - min_full_attn_seqlen;
+                if(mf_lo < lo)
+                    lo = mf_lo;
+            }
+            if(lo < 0)
+                lo = 0;
+            y_start = lo - lo % YTile; // align_down to the Q tile
+        }
+        index_t y_end;
+        if(min_full_attn_seqlen > 0)
+        {
+            y_end = seqlen_q; // min_full rows attend broadly -> safe upper bound
+        }
+        else
+        {
+            // band upper edge: r <= col + W - diff (id-shift cancels); +contextual_seqlen margin.
+            y_end = i_x + XTile + W - diff_q_kv_len + contextual_seqlen;
+            // Q-side target rows attend K cols within W of the uih end (and target K cols don't
+            // exist here); if the tile reaches that zone they pull y_end to the very end.
+            if(max_q_uih_len < seqlen_q /* num_target>0 */ && i_x + XTile + W >= max_k_uih_len)
+                y_end = seqlen_q;
+            // contextual rows themselves span [0,contextual_seqlen): when the band maps out of
+            // range (large diff) they are the only attenders -> floor y_end to cover them.
+            if(ctx_rows && y_end < contextual_seqlen)
+                y_end = contextual_seqlen;
+            if(y_end < 0)
+                y_end = 0;
+            if(y_end > seqlen_q)
+                y_end = seqlen_q;
+        }
+        return ck_tile::make_tuple(y_start, y_end);
     }
 
     // IsEdgeTile: tile needs per-pixel masking iff it is not fully inside the mask.
@@ -521,12 +570,60 @@ struct HstuSelfAttentionBlockMaskWithLocal
         return false;
     }
 
-    // --- bwd additions (M2, DESIGN §3.1) ---
+    // --- bwd additions (M2 full-scan; M8/B3 local/window tightening, self) ---
+    // See the cross note. Self has no q/k offset (diff=0). The window caps both band edges
+    // (causal: row in [col, col+W]; non-causal: [col-W, col+W]); contextual rows attend uih
+    // cols; target rows attend uih cols within W of the uih end; min_full -> full upper bound.
+    // MUST stay a kM0(YTile)-aligned SUPERSET (offline validate_tile_range_y gate).
     template <index_t YTile, index_t XTile>
     CK_TILE_HOST_DEVICE constexpr auto
-    GetTileRangeAlongY(index_t /*i_x*/, number<YTile>, number<XTile>) const
+    GetTileRangeAlongY(index_t i_x, number<YTile>, number<XTile>) const
     {
-        return ck_tile::make_tuple(0, seqlen); // conservative full-Q-scan superset (§8.2-R3)
+        const index_t W = max_attn_len;
+        const bool ctx_rows = (contextual_seqlen > 0 && i_x < max_uih_len);
+        index_t y_start;
+        if(ctx_rows)
+        {
+            y_start = 0;
+        }
+        else
+        {
+            // causal lower edge = diagonal (row>=col) -> i_x; non-causal lower = col-W. Target
+            // cols clamp col_id to max_id, so use min(i_x,max_uih_len) for the non-causal lower.
+            index_t lo = kUseCausal ? i_x : (min(i_x, max_uih_len) - W);
+            // non-causal min_full rows (row_id >= max_id-mf) attend ALL cols -> they sit at/
+            // below the band lower edge (physical start max_uih_len-mf). Causal min_full still
+            // needs row>=col, so it never drops below i_x.
+            if(!kUseCausal && min_full_attn_seqlen > 0)
+            {
+                const index_t mf_lo = max_uih_len - min_full_attn_seqlen;
+                if(mf_lo < lo)
+                    lo = mf_lo;
+            }
+            if(lo < 0)
+                lo = 0;
+            y_start = lo - lo % YTile; // align_down to the Q tile
+        }
+        index_t y_end;
+        if(min_full_attn_seqlen > 0)
+        {
+            y_end = seqlen;
+        }
+        else
+        {
+            // band upper edge: row <= col + W (contextual id-shift cancels); +ctx margin.
+            y_end = i_x + XTile + W + contextual_seqlen;
+            // target rows attend uih cols within W of the uih end; if the tile reaches that zone
+            // they pull y_end to the very end.
+            if(max_uih_len < seqlen /* num_target>0 */ && i_x + XTile + W >= max_uih_len)
+                y_end = seqlen;
+            // contextual rows themselves span [0,contextual_seqlen): floor y_end to cover them.
+            if(ctx_rows && y_end < contextual_seqlen)
+                y_end = contextual_seqlen;
+            if(y_end > seqlen)
+                y_end = seqlen;
+        }
+        return ck_tile::make_tuple(y_start, y_end);
     }
 
     template <index_t TileHeight, index_t TileWidth>
@@ -690,12 +787,35 @@ struct HstuCrossAttentionBlockMaskNoLocal
         }
     };
 
-    // --- bwd additions (M2, DESIGN §3.1) ---
+    // --- bwd additions (M2 full-scan; M8/B2 causal tightening, cross) ---
+    // See the self-attention note. Cross adds the q/k length offset diff_q_kv_len: col c is
+    // attended by rows r with r + diff_q_kv_len >= c, i.e. r >= c - diff_q_kv_len. With
+    // target_in_kv == false every K col is uih, so contextual rows reach row 0 whenever the
+    // tile is in the (entire) uih region. y_end = seqlen_q (safe upper bound).
     template <index_t YTile, index_t XTile>
     CK_TILE_HOST_DEVICE constexpr auto
-    GetTileRangeAlongY(index_t /*i_x*/, number<YTile>, number<XTile>) const
+    GetTileRangeAlongY(index_t i_x, number<YTile>, number<XTile>) const
     {
-        return ck_tile::make_tuple(0, seqlen_q); // conservative full-Q-scan superset (§8.2-R3)
+        if constexpr(!IsMasking)
+        {
+            return ck_tile::make_tuple(0, seqlen_q);
+        }
+        else
+        {
+            index_t y_start;
+            if(contextual_seqlen > 0 && i_x < max_k_uih_len)
+            {
+                y_start = 0;
+            }
+            else
+            {
+                index_t ys = i_x - diff_q_kv_len; // true min attending row (pre-align)
+                if(ys < 0)
+                    ys = 0;
+                y_start = ys - ys % YTile; // align_down to the Q tile
+            }
+            return ck_tile::make_tuple(y_start, seqlen_q);
+        }
     }
 
     template <index_t TileHeight, index_t TileWidth>
@@ -838,12 +958,40 @@ struct HstuSelfAttentionBlockMaskNoLocal
         }
     };
 
-    // --- bwd additions (M2, DESIGN §3.1) ---
+    // --- bwd additions (M2 full-scan; M8/B2 causal tightening) ---
+    // GetTileRangeAlongY: KV-block [i_x, i_x+XTile) -> the Q-row range [y_start, y_end) that
+    // attends it (transpose of GetTileRangeAlongX). B2 tightens the *causal* case to skip
+    // Q-tiles that provably attend NO column in the KV-tile. The per-pixel
+    // IsTokenPairInsideMask zeroing still runs inside every visited tile, so the only safety
+    // requirement is that the range stay a kM0(YTile)-aligned SUPERSET of the true attending
+    // set (offline validate_tile_range_y gate). Non-causal NoLocal = full attention -> exact.
     template <index_t YTile, index_t XTile>
     CK_TILE_HOST_DEVICE constexpr auto
-    GetTileRangeAlongY(index_t /*i_x*/, number<YTile>, number<XTile>) const
+    GetTileRangeAlongY(index_t i_x, number<YTile>, number<XTile>) const
     {
-        return ck_tile::make_tuple(0, seqlen); // conservative full-Q-scan superset (§8.2-R3)
+        if constexpr(!IsMasking)
+        {
+            // non-causal: every Q row attends every K col -> range is already exact.
+            return ck_tile::make_tuple(0, seqlen);
+        }
+        else
+        {
+            // causal: col c is attended by rows r >= c (clamped), so the KV-tile's min col
+            // i_x is first reached by row i_x. Contextual rows [0,contextual_seqlen) attend
+            // ALL uih cols, so any tile touching the uih region (i_x < max_uih_len) is reached
+            // by row 0. Target rows (>= max_uih_len) attend uih cols too, but they already sit
+            // inside [i_x, seqlen). y_end = seqlen is a safe upper bound.
+            index_t y_start;
+            if(contextual_seqlen > 0 && i_x < max_uih_len)
+            {
+                y_start = 0;
+            }
+            else
+            {
+                y_start = i_x - i_x % YTile; // align_down to the Q tile (self: no q/k offset)
+            }
+            return ck_tile::make_tuple(y_start, seqlen);
+        }
     }
 
     template <index_t TileHeight, index_t TileWidth>

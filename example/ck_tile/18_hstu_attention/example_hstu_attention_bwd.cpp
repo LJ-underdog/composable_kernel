@@ -38,6 +38,7 @@
 #include <ck_tile/host/arg_parser.hpp>
 #include <ck_tile/host/hip_check_error.hpp>
 #include <ck_tile/host/check_err.hpp>
+#include <ck_tile/host/timer.hpp>
 
 #include "hstu_attention_fwd_type_config.hpp"
 #include "hstu_attention_bool_switch.hpp"
@@ -131,6 +132,9 @@ auto create_args(int argc, char* argv[])
         .insert("attn_scale", "0", "scale of SiLU(Q@K). 0 means 1/max_seqlen_q")
         .insert("deterministic", "0", "deterministic dQ path (M0/M1: 0)")
         .insert("dump_grad", "0", "dump device and reference gradients to files")
+        .insert("perf", "0", "M8 MI: measure bwd kernel timing (envelope + per-kernel PRE/memset/"
+                             "MAIN/POST) via hipEvent warmup+repeat. Behind flag: off => suite/"
+                             "validation path and device code are byte-identical")
         .insert("poison_pad", "0", "M7c: over-alloc head-dim to MaxK, NaN-fill input pad tails + "
                                    "pre-poison output pad tails -> positively prove OOB head-dim "
                                    "load-zero / store-skip (any leak -> NaN -> hard FAIL)")
@@ -193,6 +197,7 @@ bool run_no_group_hstu_bwd(const ck_tile::ArgParser& arg_parser)
     const int seed            = arg_parser.get_int("seed");
     const bool use_normal_dist = static_cast<bool>(arg_parser.get_int("norm_dist"));
     const bool dump_grad      = static_cast<bool>(arg_parser.get_int("dump_grad"));
+    const bool measure_perf   = static_cast<bool>(arg_parser.get_int("perf"));
 
     const int window_size          = arg_parser.get_int("local_len");
     const int contextual_seqlen    = arg_parser.get_int("context_len");
@@ -611,6 +616,63 @@ bool run_no_group_hstu_bwd(const ck_tile::ArgParser& arg_parser)
         dq_dev.FromDevice(dq_host.data());
         dk_dev.FromDevice(dk_host.data());
         dv_dev.FromDevice(dv_host.data());
+
+        // ---- M8 MI: behind -perf. The validated dQ/dK/dV are already on host (above),
+        // so the timing re-runs (which clobber dq_dev/dq_acc) do not affect correctness.
+        // Envelope = whole bwd (PRE+memset+MAIN+POST) warmup+repeat; per-kernel = one
+        // dispatch with measure_perf=true filling bp.perf_*_ms. ---------------------------
+        if(measure_perf)
+        {
+            auto run_bwd = [&](HstuAttentionNoGroupBwdParams& p) {
+                if constexpr(std::is_same<InOutDataType, ck_tile::bf16_t>::value)
+                    hstu_attention_no_group_backward_bf16(p, stream);
+                else
+                    hstu_attention_no_group_backward_fp16(p, stream);
+            };
+            // GEMM-only FLOP model (5-GEMM bwd; ignores elementwise) per draft-M8-perf §2.
+            auto per_flops = [&](long lq, long lkv) -> double {
+                return 2.0 * (2.0 * (double)lq * lkv * hdim_qk + 3.0 * (double)lq * lkv * hdim_v);
+            };
+            double total_flops = 0.0;
+            if(is_jagged)
+            {
+                for(int i = 0; i < num_batch; i++)
+                    total_flops += per_flops(seq_offsets_q[i + 1] - seq_offsets_q[i],
+                                             seq_offsets_kv[i + 1] - seq_offsets_kv[i]);
+                total_flops *= num_head;
+            }
+            else
+            {
+                total_flops = per_flops((long)phy_seqlen_q, (long)phy_seqlen_kv) *
+                              (double)num_head * (double)num_batch;
+            }
+
+            bp.measure_perf = false; // envelope uses the normal (un-instrumented) launch path
+            for(int i = 0; i < 3; i++)
+                run_bwd(bp);
+            HIP_CHECK_ERROR(hipStreamSynchronize(stream));
+            ck_tile::gpu_timer env{};
+            env.start(stream);
+            for(int i = 0; i < 10; i++)
+                run_bwd(bp);
+            env.stop(stream);
+            const float env_ms = env.duration() / 10.f;
+
+            bp.measure_perf = true; // per-kernel attribution
+            run_bwd(bp);
+            HIP_CHECK_ERROR(hipStreamSynchronize(stream));
+            bp.measure_perf = false;
+
+            auto tflops = [&](float ms) { return ms > 0.f ? (total_flops / ms) / 1.0e9 : 0.0; };
+            std::cout << "PERF kernel=envelope metric=time_ms value=" << env_ms << "\n"
+                      << "PERF kernel=envelope metric=TFLOPS value=" << tflops(env_ms) << "\n"
+                      << "PERF kernel=PRE metric=time_ms value=" << bp.perf_pre_ms << "\n"
+                      << "PERF kernel=memset metric=time_ms value=" << bp.perf_memset_ms << "\n"
+                      << "PERF kernel=MAIN metric=time_ms value=" << bp.perf_main_ms << "\n"
+                      << "PERF kernel=MAIN metric=TFLOPS value=" << tflops(bp.perf_main_ms) << "\n"
+                      << "PERF kernel=POST metric=time_ms value=" << bp.perf_post_ms << "\n"
+                      << "PERF total_gemm_flops=" << total_flops << std::endl;
+        }
     }
 
     bool numeric_pass = true;
@@ -788,6 +850,7 @@ bool run_group_hstu_bwd(const ck_tile::ArgParser& arg_parser, int num_group)
     const int seed             = arg_parser.get_int("seed");
     const bool use_normal_dist = static_cast<bool>(arg_parser.get_int("norm_dist"));
     const bool dump_grad       = static_cast<bool>(arg_parser.get_int("dump_grad"));
+    const bool measure_perf    = static_cast<bool>(arg_parser.get_int("perf"));
 
     HSTU_CHECK(num_group > 1, "run_group_hstu_bwd should only be called when num_group > 1!");
     HSTU_CHECK(num_batch > 0 && num_batch % num_group == 0,
@@ -1207,6 +1270,52 @@ bool run_group_hstu_bwd(const ck_tile::ArgParser& arg_parser, int num_group)
         dq_dev.FromDevice(dq_host.data());
         dk_dev.FromDevice(dk_host.data());
         dv_dev.FromDevice(dv_host.data());
+
+        // ---- M8 MI (group): behind -perf; same scheme as no_group. group is packed
+        // (jagged), so FLOPs sum per-batch from cu_seqlens. -------------------------------
+        if(measure_perf)
+        {
+            auto run_bwd = [&](HstuAttentionGroupBwdParams& p) {
+                if constexpr(std::is_same<InOutDataType, ck_tile::bf16_t>::value)
+                    hstu_attention_group_backward_bf16(p, stream);
+                else
+                    hstu_attention_group_backward_fp16(p, stream);
+            };
+            auto per_flops = [&](long lq, long lkv) -> double {
+                return 2.0 * (2.0 * (double)lq * lkv * hdim_qk + 3.0 * (double)lq * lkv * hdim_v);
+            };
+            double total_flops = 0.0;
+            for(int i = 0; i < num_batch; i++)
+                total_flops += per_flops(seq_offsets_q[i + 1] - seq_offsets_q[i],
+                                         seq_offsets_kv[i + 1] - seq_offsets_kv[i]);
+            total_flops *= num_head;
+
+            bp.measure_perf = false;
+            for(int i = 0; i < 3; i++)
+                run_bwd(bp);
+            HIP_CHECK_ERROR(hipStreamSynchronize(stream));
+            ck_tile::gpu_timer env{};
+            env.start(stream);
+            for(int i = 0; i < 10; i++)
+                run_bwd(bp);
+            env.stop(stream);
+            const float env_ms = env.duration() / 10.f;
+
+            bp.measure_perf = true;
+            run_bwd(bp);
+            HIP_CHECK_ERROR(hipStreamSynchronize(stream));
+            bp.measure_perf = false;
+
+            auto tflops = [&](float ms) { return ms > 0.f ? (total_flops / ms) / 1.0e9 : 0.0; };
+            std::cout << "PERF kernel=envelope metric=time_ms value=" << env_ms << "\n"
+                      << "PERF kernel=envelope metric=TFLOPS value=" << tflops(env_ms) << "\n"
+                      << "PERF kernel=PRE metric=time_ms value=" << bp.perf_pre_ms << "\n"
+                      << "PERF kernel=memset metric=time_ms value=" << bp.perf_memset_ms << "\n"
+                      << "PERF kernel=MAIN metric=time_ms value=" << bp.perf_main_ms << "\n"
+                      << "PERF kernel=MAIN metric=TFLOPS value=" << tflops(bp.perf_main_ms) << "\n"
+                      << "PERF kernel=POST metric=time_ms value=" << bp.perf_post_ms << "\n"
+                      << "PERF total_gemm_flops=" << total_flops << std::endl;
+        }
     }
 
     bool numeric_pass = true;
