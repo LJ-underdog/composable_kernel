@@ -62,9 +62,11 @@ struct batched_backward_dispatch
                 : static_cast<size_t>(param.num_batch) *
                       static_cast<size_t>(param.batch_stride_dq_acc);
 
-        // grid.x covers the largest seqlen_kv; split_idx = i_tile_n -> num_splits = grid.x
+        // grid.x covers the largest seqlen_kv; split_idx = i_tile_n -> num_splits = grid.x.
+        // cross: jagged uses max_seqlen_kv (self path aliases it to max_seqlen_q -> unchanged);
+        // batched already carries the seqlen_kv scalar (correct in both directions).
         const ck_tile::index_t grid_seqlen_kv =
-            param.is_jagged ? param.max_seqlen_q : param.seqlen_kv;
+            param.is_jagged ? param.max_seqlen_kv : param.seqlen_kv;
         const int num_splits =
             kIsDeterministic
                 ? static_cast<int>(ck_tile::integer_divide_ceil(grid_seqlen_kv, Pipeline::kN0))
@@ -384,12 +386,18 @@ struct batched_backward_dispatch
         // Hoist the pad BOOL_SWITCH_2 once (fwd style) so SiLU+softmax share it.
         BOOL_SWITCH_2(pad_qk, kPadHeadDimQ, pad_v, kPadHeadDimV, [&] {
             BOOL_SWITCH(use_local, kUseLocal, [&] {
-                using Mask = typename ck_tile::
-                    HstuBlockMasking<false /*cross*/, kUseCausal, kUseLocal>::Type;
-                if constexpr(kUseSoftmax)
-                    RunSoftmax<Mask, kPadHeadDimQ, kPadHeadDimV>(param, stream);
-                else
-                    RunSilu<Mask, kPadHeadDimQ, kPadHeadDimV>(param, stream);
+                // cross-attention is a RUNTIME switch (mirrors fwd dispatch :97), not an
+                // instance axis: both legs compile in the same .cpp. Wrap ONLY the mask
+                // typedef + downstream Pipeline/Kernel; the false leg resolves to the same
+                // HstuBlockMasking<false,...>::Type as M7c -> byte-identical (see draft §4).
+                BOOL_SWITCH(param.is_cross_attention, kIsCrossAttention, [&] {
+                    using Mask = typename ck_tile::
+                        HstuBlockMasking<kIsCrossAttention, kUseCausal, kUseLocal>::Type;
+                    if constexpr(kUseSoftmax)
+                        RunSoftmax<Mask, kPadHeadDimQ, kPadHeadDimV>(param, stream);
+                    else
+                        RunSilu<Mask, kPadHeadDimQ, kPadHeadDimV>(param, stream);
+                });
             });
         });
     }

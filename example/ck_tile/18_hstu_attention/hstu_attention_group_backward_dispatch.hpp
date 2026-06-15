@@ -84,10 +84,12 @@ struct group_backward_dispatch
     launch_main_and_post(HstuAttentionGroupBwdParams& param, hipStream_t stream, Kargs& kargs)
     {
         const size_t single = static_cast<size_t>(param.total_dq_acc_elems); // one packed slot
+        // cross: bwd is KV-block-parallel -> grid/num_splits over max_seqlen_kv (self path
+        // aliases it to max_seqlen_q -> unchanged).
         const int num_splits =
             kIsDeterministic
                 ? static_cast<int>(
-                      ck_tile::integer_divide_ceil(param.max_seqlen_q, Pipeline::kN0))
+                      ck_tile::integer_divide_ceil(param.max_seqlen_kv, Pipeline::kN0))
                 : 1;
 
         HIP_CHECK_ERROR(hipMemsetAsync(param.dq_acc_ptr,
@@ -96,7 +98,7 @@ struct group_backward_dispatch
                                            sizeof(typename TC::GemmAccDataType),
                                        stream));
 
-        dim3 grid  = Kernel::GridSize(param.num_batch, param.num_head, param.max_seqlen_q);
+        dim3 grid  = Kernel::GridSize(param.num_batch, param.num_head, param.max_seqlen_kv);
         dim3 block = Kernel::BlockSize();
         constexpr ck_tile::index_t kBlockPerCu = Kernel::kBlockPerCu;
         (void)ck_tile::launch_kernel(
@@ -140,10 +142,13 @@ struct group_backward_dispatch
     {
         // M7c: kPadHeadDimQ/V are NTTPs from the Run() BOOL_SWITCH_2 (modulo-derived).
         // both mask types share kUseCausal; window resolved at runtime in-kernel
+        // cross-attention is a RUNTIME switch (not an instance axis): wrap the mask
+        // typedefs + downstream double pipeline/kernel; false leg == M7c byte-identical.
+        BOOL_SWITCH(param.is_cross_attention, kIsCrossAttention, [&] {
         using LocalMask =
-            typename ck_tile::HstuBlockMasking<false /*cross*/, kUseCausal, true>::Type;
+            typename ck_tile::HstuBlockMasking<kIsCrossAttention, kUseCausal, true>::Type;
         using NoLocalMask =
-            typename ck_tile::HstuBlockMasking<false /*cross*/, kUseCausal, false>::Type;
+            typename ck_tile::HstuBlockMasking<kIsCrossAttention, kUseCausal, false>::Type;
 
         using PipelineLocal = ck_tile::HstuAttentionBwdDQDKDVPipelineKRKTRVR<
             ProblemFor<LocalMask, kPadHeadDimQ, kPadHeadDimV>>;
@@ -199,6 +204,7 @@ struct group_backward_dispatch
                                        param.split_stride_dq_acc);
 
         launch_main_and_post<PipelineLocal, Kernel>(param, stream, kargs);
+        }); // BOOL_SWITCH(is_cross_attention)
     }
 
     // M5b group softmax. PRE (D=rowsum(O*dO)) -> memset dq_acc -> MAIN (group softmax
@@ -207,10 +213,12 @@ struct group_backward_dispatch
     static void RunSoftmax(HstuAttentionGroupBwdParams& param, hipStream_t stream)
     {
         // M7c: kPadHeadDimQ/V NTTPs from Run() BOOL_SWITCH_2 (see RunSilu note).
+        // cross-attention runtime switch (see RunSilu note); false leg == M7c byte-identical.
+        BOOL_SWITCH(param.is_cross_attention, kIsCrossAttention, [&] {
         using LocalMask =
-            typename ck_tile::HstuBlockMasking<false /*cross*/, kUseCausal, true>::Type;
+            typename ck_tile::HstuBlockMasking<kIsCrossAttention, kUseCausal, true>::Type;
         using NoLocalMask =
-            typename ck_tile::HstuBlockMasking<false /*cross*/, kUseCausal, false>::Type;
+            typename ck_tile::HstuBlockMasking<kIsCrossAttention, kUseCausal, false>::Type;
 
         using PipelineLocal = ck_tile::HstuAttentionWithSoftmaxBwdDQDKDVPipelineKRKTRVR<
             ProblemFor<LocalMask, kPadHeadDimQ, kPadHeadDimV>>;
@@ -297,6 +305,7 @@ struct group_backward_dispatch
                                        param.split_stride_dq_acc);
 
         launch_main_and_post<PipelineLocal, Kernel>(param, stream, kargs);
+        }); // BOOL_SWITCH(is_cross_attention)
     }
 
     static void Run(HstuAttentionGroupBwdParams& param, hipStream_t stream)
