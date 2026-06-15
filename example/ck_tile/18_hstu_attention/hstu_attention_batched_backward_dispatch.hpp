@@ -116,13 +116,13 @@ struct batched_backward_dispatch
         }
     }
 
-    template <typename Mask>
+    template <typename Mask, bool kPadHeadDimQ, bool kPadHeadDimV>
     static void RunSilu(HstuAttentionNoGroupBwdParams& param, hipStream_t stream)
     {
-        // hdim64: head-dim padding never needed in M1 (pad value 0)
-        constexpr ck_tile::index_t kPadHeadDimQ = 0;
-        constexpr ck_tile::index_t kPadHeadDimV = 0;
-        constexpr ck_tile::index_t occupancy    = 1;
+        // M7c: kPadHeadDimQ/V are now NTTPs from the Run() BOOL_SWITCH_2 (modulo-derived).
+        // Canonical hdim==MaxK -> both false -> byte-identical to M7b. Q-group flag pads
+        // Q/K/dQ/dK/dQ_acc (kQKHeaddim); V-group flag pads V/dO/dV/O (kVHeaddim) — never crossed.
+        constexpr ck_tile::index_t occupancy = 1;
 
         // ck_hstu TileFmhaBwdTraits<kPadHeadDimQ, kPadHeadDimV, BiasEnum, kHasBiasGrad, kBlockPerCu>
         using Traits = ck_tile::TileFmhaBwdTraits<kPadHeadDimQ,
@@ -227,12 +227,11 @@ struct batched_backward_dispatch
 
     // M5 softmax path (no_group = batched + jagged). PRE (D=rowsum(O*dO)) -> memset
     // dq_acc -> MAIN (softmax pipeline, reads LSE+D) -> POST (convert dq_acc->dq).
-    template <typename Mask>
+    template <typename Mask, bool kPadHeadDimQ, bool kPadHeadDimV>
     static void RunSoftmax(HstuAttentionNoGroupBwdParams& param, hipStream_t stream)
     {
-        constexpr ck_tile::index_t kPadHeadDimQ = 0;
-        constexpr ck_tile::index_t kPadHeadDimV = 0;
-        constexpr ck_tile::index_t occupancy    = 1;
+        // M7c: kPadHeadDimQ/V NTTPs from Run() BOOL_SWITCH_2 (see RunSilu note).
+        constexpr ck_tile::index_t occupancy = 1;
 
         using Traits = ck_tile::TileFmhaBwdTraits<kPadHeadDimQ,
                                                   kPadHeadDimV,
@@ -368,43 +367,31 @@ struct batched_backward_dispatch
         // into the pipeline/kernel (set+split dq_acc + POST reduce) — no separate branch here;
         // both SiLU and softmax paths support atomic & deterministic.
 
-        if constexpr(kUseSoftmax)
-        {
-            // M5/M7b: softmax (no_group = batched + jagged). symmetric hdim ∈ {64,96,128,256}.
-            // MaxK is the canonical tile picked by HDIM_SWITCH; require hdim_qk==hdim_v==MaxK so
-            // the head-dim fits the tile exactly (no padding) — reject non-canonical hdims that
-            // HDIM_SWITCH would silently round up to a larger tile (M7c handles hdim_qk!=hdim_v
-            // and arbitrary hdim via the fwd-style pad switch).
-            if(param.hdim_qk != param.hdim_v || param.hdim_qk != MaxK)
-                throw std::runtime_error(
-                    "HSTU bwd softmax supports symmetric hdim_qk==hdim_v in {64,96,128,256} only");
+        // M7c: accept asymmetric hdim_qk!=hdim_v and non-canonical hdim via head-dim padding.
+        // HDIM_SWITCH already guarantees MaxK >= max(hdim_qk,hdim_v); the only real reject is
+        // hdim>256 (kept in hstu_attention_hdim_switch.hpp). pad flags are modulo-derived
+        // (fwd-style: !(hdim % tile == 0)) so canonical hdim==MaxK -> false -> byte-identical
+        // to M7b. Q-group flag (kQKHeaddim) and V-group flag (kVHeaddim) are tracked SEPARATELY.
+        if(param.hdim_qk <= 0 || param.hdim_v <= 0 || param.hdim_qk > MaxK || param.hdim_v > MaxK)
+            throw std::runtime_error("HSTU bwd: hdim_qk/hdim_v must be in (0, MaxK]; hdim>256 unsupported");
 
-            const bool use_local = (param.window_size > 0);
+        constexpr ck_tile::index_t kQKHeaddim = HstuBwdShape<MaxK>::kQKHeaddim;
+        constexpr ck_tile::index_t kVHeaddim  = HstuBwdShape<MaxK>::kVHeaddim;
+        const bool pad_qk = !(param.hdim_qk % kQKHeaddim == 0);
+        const bool pad_v  = !(param.hdim_v % kVHeaddim == 0);
+        const bool use_local = (param.window_size > 0);
+
+        // Hoist the pad BOOL_SWITCH_2 once (fwd style) so SiLU+softmax share it.
+        BOOL_SWITCH_2(pad_qk, kPadHeadDimQ, pad_v, kPadHeadDimV, [&] {
             BOOL_SWITCH(use_local, kUseLocal, [&] {
                 using Mask = typename ck_tile::
                     HstuBlockMasking<false /*cross*/, kUseCausal, kUseLocal>::Type;
-                RunSoftmax<Mask>(param, stream);
+                if constexpr(kUseSoftmax)
+                    RunSoftmax<Mask, kPadHeadDimQ, kPadHeadDimV>(param, stream);
+                else
+                    RunSilu<Mask, kPadHeadDimQ, kPadHeadDimV>(param, stream);
             });
-        }
-        else
-        {
-            // M1/M2: SiLU. (seqlen never padded — OOB via buffer_load)
-            // M2: HSTU 5-factor mask (causal/window/contextual/min_full/num_target).
-            // kUseLocal selected at runtime by window_size>0 (mirrors fwd). kUseCausal=0 &
-            // window=0 -> NoLocal<false> with IsMasking=false (== M1 no-mask).
-            // M7b: symmetric hdim ∈ {64,96,128,256}; require hdim_qk==hdim_v==MaxK (see softmax
-            // branch above for the rationale / non-canonical guard).
-            if(param.hdim_qk != param.hdim_v || param.hdim_qk != MaxK)
-                throw std::runtime_error(
-                    "HSTU bwd SiLU supports symmetric hdim_qk==hdim_v in {64,96,128,256} only");
-
-            const bool use_local = (param.window_size > 0);
-            BOOL_SWITCH(use_local, kUseLocal, [&] {
-                using Mask = typename ck_tile::
-                    HstuBlockMasking<false /*cross*/, kUseCausal, kUseLocal>::Type;
-                RunSilu<Mask>(param, stream);
-            });
-        }
+        });
     }
 };
 

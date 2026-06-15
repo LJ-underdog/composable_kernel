@@ -48,7 +48,8 @@ struct group_backward_dispatch
 
     using TC = HstuAttentionFwdTypeConfig<InOutDataType>;
 
-    template <typename Mask>
+    // M7c: pad flags are NTTPs (was hardcoded <0,0>); built inside the Run() BOOL_SWITCH_2.
+    template <typename Mask, bool kPadHeadDimQ, bool kPadHeadDimV>
     using ProblemFor = ck_tile::BlockFmhaBwdPipelineProblem<
         typename TC::ODataType,
         typename TC::ODataType,
@@ -71,7 +72,7 @@ struct group_backward_dispatch
         Mask,
         ck_tile::BlockDropoutBwd<false, true, false>,
         false, // kUseTrLoad
-        ck_tile::TileFmhaBwdTraits<0, 0,
+        ck_tile::TileFmhaBwdTraits<kPadHeadDimQ, kPadHeadDimV,
                                    ck_tile::BlockAttentionBiasEnum::NO_BIAS,
                                    false, 1>>;
 
@@ -134,21 +135,20 @@ struct group_backward_dispatch
         }
     }
 
+    template <bool kPadHeadDimQ, bool kPadHeadDimV>
     static void RunSilu(HstuAttentionGroupBwdParams& param, hipStream_t stream)
     {
-        constexpr ck_tile::index_t kPadHeadDimQ = 0;
-        constexpr ck_tile::index_t kPadHeadDimV = 0;
-
+        // M7c: kPadHeadDimQ/V are NTTPs from the Run() BOOL_SWITCH_2 (modulo-derived).
         // both mask types share kUseCausal; window resolved at runtime in-kernel
         using LocalMask =
             typename ck_tile::HstuBlockMasking<false /*cross*/, kUseCausal, true>::Type;
         using NoLocalMask =
             typename ck_tile::HstuBlockMasking<false /*cross*/, kUseCausal, false>::Type;
 
-        using PipelineLocal =
-            ck_tile::HstuAttentionBwdDQDKDVPipelineKRKTRVR<ProblemFor<LocalMask>>;
-        using PipelineNoLocal =
-            ck_tile::HstuAttentionBwdDQDKDVPipelineKRKTRVR<ProblemFor<NoLocalMask>>;
+        using PipelineLocal = ck_tile::HstuAttentionBwdDQDKDVPipelineKRKTRVR<
+            ProblemFor<LocalMask, kPadHeadDimQ, kPadHeadDimV>>;
+        using PipelineNoLocal = ck_tile::HstuAttentionBwdDQDKDVPipelineKRKTRVR<
+            ProblemFor<NoLocalMask, kPadHeadDimQ, kPadHeadDimV>>;
 
         using DKEpilogue = ck_tile::Default2DEpilogue<ck_tile::Default2DEpilogueProblem<
             typename TC::GemmAccDataType, typename TC::ODataType, false, (kPadHeadDimQ > 0)>>;
@@ -203,20 +203,19 @@ struct group_backward_dispatch
 
     // M5b group softmax. PRE (D=rowsum(O*dO)) -> memset dq_acc -> MAIN (group softmax
     // kernel: per-group hyper-params + double pipeline + LSE/D) -> POST (convert dq).
+    template <bool kPadHeadDimQ, bool kPadHeadDimV>
     static void RunSoftmax(HstuAttentionGroupBwdParams& param, hipStream_t stream)
     {
-        constexpr ck_tile::index_t kPadHeadDimQ = 0;
-        constexpr ck_tile::index_t kPadHeadDimV = 0;
-
+        // M7c: kPadHeadDimQ/V NTTPs from Run() BOOL_SWITCH_2 (see RunSilu note).
         using LocalMask =
             typename ck_tile::HstuBlockMasking<false /*cross*/, kUseCausal, true>::Type;
         using NoLocalMask =
             typename ck_tile::HstuBlockMasking<false /*cross*/, kUseCausal, false>::Type;
 
-        using PipelineLocal =
-            ck_tile::HstuAttentionWithSoftmaxBwdDQDKDVPipelineKRKTRVR<ProblemFor<LocalMask>>;
-        using PipelineNoLocal =
-            ck_tile::HstuAttentionWithSoftmaxBwdDQDKDVPipelineKRKTRVR<ProblemFor<NoLocalMask>>;
+        using PipelineLocal = ck_tile::HstuAttentionWithSoftmaxBwdDQDKDVPipelineKRKTRVR<
+            ProblemFor<LocalMask, kPadHeadDimQ, kPadHeadDimV>>;
+        using PipelineNoLocal = ck_tile::HstuAttentionWithSoftmaxBwdDQDKDVPipelineKRKTRVR<
+            ProblemFor<NoLocalMask, kPadHeadDimQ, kPadHeadDimV>>;
 
         using DKEpilogue = ck_tile::Default2DEpilogue<ck_tile::Default2DEpilogueProblem<
             typename TC::GemmAccDataType, typename TC::ODataType, false, (kPadHeadDimQ > 0)>>;
@@ -302,20 +301,27 @@ struct group_backward_dispatch
 
     static void Run(HstuAttentionGroupBwdParams& param, hipStream_t stream)
     {
-        // M7b: symmetric hdim ∈ {64,96,128,256}; require hdim_qk==hdim_v==MaxK (the canonical
-        // tile HDIM_SWITCH picked) so the head-dim fits the tile exactly (no padding). Rejects
-        // non-canonical hdims that would silently round up to a larger tile. (M7c: hdim_qk!=hdim_v
-        // + arbitrary hdim via the fwd-style pad switch.)
-        if(param.hdim_qk != param.hdim_v || param.hdim_qk != MaxK)
-            throw std::runtime_error(
-                "HSTU bwd group supports symmetric hdim_qk==hdim_v in {64,96,128,256} only");
+        // M7c: accept asymmetric hdim_qk!=hdim_v and non-canonical hdim via head-dim padding
+        // (mirrors the no_group dispatch). HDIM_SWITCH guarantees MaxK>=max(hdim_qk,hdim_v); the
+        // only real reject is hdim>256 (HDIM_SWITCH else-throw). pad flags are modulo-derived so
+        // canonical hdim==MaxK -> false -> byte-identical to M7b. QK flag (kQKHeaddim) and V flag
+        // (kVHeaddim) are tracked SEPARATELY (never crossed).
+        if(param.hdim_qk <= 0 || param.hdim_v <= 0 || param.hdim_qk > MaxK || param.hdim_v > MaxK)
+            throw std::runtime_error("HSTU bwd group: hdim_qk/hdim_v must be in (0, MaxK]; hdim>256 unsupported");
+
+        constexpr ck_tile::index_t kQKHeaddim = HstuBwdShape<MaxK>::kQKHeaddim;
+        constexpr ck_tile::index_t kVHeaddim  = HstuBwdShape<MaxK>::kVHeaddim;
+        const bool pad_qk = !(param.hdim_qk % kQKHeaddim == 0);
+        const bool pad_v  = !(param.hdim_v % kVHeaddim == 0);
 
         // M6b: kIsDeterministic threaded into the Problem/kernel (set+split dq_acc + reduce
         // POST). Both SiLU and softmax group paths support atomic & deterministic.
-        if constexpr(kUseSoftmax)
-            RunSoftmax(param, stream); // M5b / M6b
-        else
-            RunSilu(param, stream);
+        BOOL_SWITCH_2(pad_qk, kPadHeadDimQ, pad_v, kPadHeadDimV, [&] {
+            if constexpr(kUseSoftmax)
+                RunSoftmax<kPadHeadDimQ, kPadHeadDimV>(param, stream); // M5b / M6b
+            else
+                RunSilu<kPadHeadDimQ, kPadHeadDimV>(param, stream);
+        });
     }
 };
 
