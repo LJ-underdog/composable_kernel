@@ -115,5 +115,70 @@ struct HstuAttentionNoGroupBwdParams
 // stays per-batch. Field naming mirrors HstuAttentionGroupFwdParams.
 struct HstuAttentionGroupBwdParams
 {
-    // M0: placeholder. The group (multi-sequence) path is implemented in M4.
+    bool is_cross_attention; // M4: self-attention only (kv offsets == q offsets)
+
+    ck_tile::index_t num_group;
+    ck_tile::index_t num_batch;
+    const void* seq_q_offsets_ptr;  // int32, size num_batch+1 (token-major packed)
+    const void* seq_kv_offsets_ptr; // int32, size num_batch+1
+    ck_tile::index_t max_seqlen_q;  // max over all groups' max_seqlen_q (grid sizing)
+
+    const void* q_ptr;
+    const void* k_ptr;
+    const void* v_ptr;
+    const void* o_ptr; // softmax path only
+
+    ck_tile::index_t hdim_qk;
+    ck_tile::index_t hdim_v;
+    ck_tile::index_t num_head;
+    ck_tile::index_t nhead_ratio_qk; // =1 (HSTU MHA; GQA/MQA placeholder, U4)
+
+    // ---- global scale (alpha is single-valued in all three modes, D6) --------
+    float alpha;
+
+    // ---- mask switches / per-group hyper-params (device pointers) ------------
+    bool use_causal;  // uniform across groups (compile-time axis in dispatch)
+    bool use_softmax; // M5
+    const void* num_targets_ptr; // per-batch int32 (== num_targets_ptr[i_batch])
+    const void* group_attn_scale_ptr;          // float[num_group]; scale_p source
+    const void* group_max_seqlen_q_ptr;        // int32[num_group]; scale_p fallback
+    const void* group_window_size_ptr;         // int32[num_group]
+    const void* group_contextual_seqlen_ptr;   // int32[num_group]
+    const void* group_min_full_attn_seqlen_ptr;// int32[num_group]
+
+    // ---- input strides (packed token-major; batch_stride = dim0 stride) ------
+    ck_tile::index_t seq_stride_q;
+    ck_tile::index_t seq_stride_k;
+    ck_tile::index_t seq_stride_v;
+    ck_tile::index_t seq_stride_o;
+    ck_tile::index_t nhead_stride_q;
+    ck_tile::index_t nhead_stride_k;
+    ck_tile::index_t nhead_stride_v;
+    ck_tile::index_t nhead_stride_o;
+
+    // ---- bwd input: dO -------------------------------------------------------
+    const void* do_ptr;
+    ck_tile::index_t seq_stride_do;
+    ck_tile::index_t nhead_stride_do;
+
+    const void* lse_ptr; // softmax path only
+
+    // ---- bwd outputs: dQ/dK/dV ----------------------------------------------
+    void* dq_ptr;
+    void* dk_ptr;
+    void* dv_ptr;
+    ck_tile::index_t seq_stride_dq;
+    ck_tile::index_t seq_stride_dk;
+    ck_tile::index_t seq_stride_dv;
+    ck_tile::index_t nhead_stride_dq;
+    ck_tile::index_t nhead_stride_dk;
+    ck_tile::index_t nhead_stride_dv;
+
+    // ---- dQ workspace (float dq_acc, atomic path nsplits=1) ------------------
+    void* dq_acc_ptr;
+    ck_tile::index_t stride_dq_acc;       // token stride (== H*hdim_qk)
+    ck_tile::index_t nhead_stride_dq_acc; // == hdim_qk
+    ck_tile::index_t total_dq_acc_elems;  // ΣL*H*hdim_qk (whole packed buffer)
+
+    bool kIsDeterministic; // M6
 };
