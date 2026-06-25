@@ -414,19 +414,27 @@ struct HstuAttentionBwdDQDKDVPipelineKRKTRVR
             // (silu(0)*scale_p=0 but dsilu(0)=0.5 != 0; -inf is forbidden -> NaN). On edge
             // tiles, clear p & g where !IsTokenPairInsideMask. ds=dp*g then auto-zeros (g=0),
             // so dV/dK/dQ get no contribution from masked pairs (matches reference dS=0).
-            if constexpr(FmhaMask::IsMasking)
+            //
+            // P1-1 fix: gate on the RUNTIME mask.IsEdgeTile, NOT compile-time
+            // FmhaMask::IsMasking. NoLocal sets IsMasking=kUseCausal, so with causal=0 the
+            // old `if constexpr(IsMasking)` deleted this block entirely -- yet num_target>0
+            // still requires masking the target region (max_uih_len = seqlen - num_target <
+            // seqlen), and IsFullTileInsideMask already flags those tiles as edge for both
+            // causal branches. The reference applies IsTokenPairInsideMask unconditionally
+            // (reference_hstu_attention_bwd.hpp:671), and the fwd pipeline likewise checks
+            // at runtime; this aligns bwd with both. Pure no-mask (causal=0, no factors)
+            // stays cheap: IsEdgeTile is false for fully-inside tiles -> no per-pixel sweep
+            // (tile-divisible no-mask flags zero edge tiles).
+            if(mask.IsEdgeTile(
+                   seqlen_q_step, k_origin.at(number<0>{}), number<kM0>{}, number<kN0>{}))
             {
-                if(mask.IsEdgeTile(
-                       seqlen_q_step, k_origin.at(number<0>{}), number<kM0>{}, number<kN0>{}))
-                {
-                    auto is_masked_out = [&](auto tile_idx) {
-                        const int row = seqlen_q_step + tile_idx.at(number<0>{});
-                        const int col = k_origin.at(number<0>{}) + tile_idx.at(number<1>{});
-                        return !mask.IsTokenPairInsideMask(row, col);
-                    };
-                    set_tile_if(p, type_convert<AccDataType>(0.0f), is_masked_out);
-                    set_tile_if(g, type_convert<AccDataType>(0.0f), is_masked_out);
-                }
+                auto is_masked_out = [&](auto tile_idx) {
+                    const int row = seqlen_q_step + tile_idx.at(number<0>{});
+                    const int col = k_origin.at(number<0>{}) + tile_idx.at(number<1>{});
+                    return !mask.IsTokenPairInsideMask(row, col);
+                };
+                set_tile_if(p, type_convert<AccDataType>(0.0f), is_masked_out);
+                set_tile_if(g, type_convert<AccDataType>(0.0f), is_masked_out);
             }
 
             const auto p_gemm = cast_tile<GemmDataType>(p);
