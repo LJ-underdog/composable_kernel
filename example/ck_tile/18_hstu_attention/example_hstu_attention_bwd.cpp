@@ -232,6 +232,11 @@ bool run_no_group_hstu_bwd(const ck_tile::ArgParser& arg_parser)
     ck_tile::DeviceMem dv_dev(dv_host.get_element_space_size_in_bytes());
     ck_tile::DeviceMem num_targets_dev(std::max<size_t>(num_targets.size(), 1) * sizeof(int));
 
+    // float dQ accumulation workspace (atomic path, nsplits=1; same packed layout as dQ)
+    const size_t dq_acc_elems =
+        static_cast<size_t>(batches_for_alloc) * phy_seqlen_q * num_head * hdim_qk;
+    ck_tile::DeviceMem dq_acc_dev(dq_acc_elems * sizeof(CompDataType));
+
     q_dev.ToDevice(q_host.data());
     k_dev.ToDevice(k_host.data());
     v_dev.ToDevice(v_host.data());
@@ -362,7 +367,7 @@ bool run_no_group_hstu_bwd(const ck_tile::ArgParser& arg_parser)
         bp.d_ptr               = nullptr;
         bp.nhead_stride_lsed   = 0;
         bp.batch_stride_lsed   = 0;
-        bp.dq_acc_ptr          = nullptr;
+        bp.dq_acc_ptr          = dq_acc_dev.GetDeviceBuffer();
         bp.stride_dq_acc       = dq_host.get_strides()[1]; // same layout as dQ
         bp.nhead_stride_dq_acc = dq_host.get_strides()[2];
         bp.batch_stride_dq_acc = dq_host.get_strides()[0];
@@ -499,8 +504,7 @@ int main(int argc, char* argv[])
 
     bool numeric_pass = run_no_group_hstu_bwd<ck_tile::bf16_t>(arg_parser);
 
-    // M0: exit 0 as long as the dispatch -> launch -> reference path completes.
-    // TODO(M1): flip the exit code to be driven by numerical PASS once MAIN is wired.
+    // M1: real SiLU MAIN — exit code is driven by numerical correctness.
     std::cout << "numeric_pass=" << (numeric_pass ? "true" : "false") << std::endl;
-    return 0;
+    return numeric_pass ? 0 : -2;
 }
