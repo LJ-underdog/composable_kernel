@@ -23,6 +23,31 @@ endif()
 
 target_compile_options(${EXAMPLE_HSTU_ATTENTION} PRIVATE ${EXAMPLE_HSTU_ATTENTION_COMPILE_OPTIONS})
 
+# ---------------------------------------------------------------------------
+# HSTU attention BACKWARD example target (M0 scaffold; EXCLUDE_FROM_ALL)
+# ---------------------------------------------------------------------------
+set(EXAMPLE_HSTU_ATTENTION_BWD "tile_example_hstu_attention_bwd")
+message("adding example ${EXAMPLE_HSTU_ATTENTION_BWD}")
+file(GLOB BWD_INSTANCE_SRCS instances/*backward*.cpp)
+# the bwd harness runs the GPU forward (to produce O) before the backward, so it
+# also needs the bf16 forward entry + forward bf16 instances linked in.
+file(GLOB FWD_BF16_INSTANCE_SRCS instances/*forward_bf16*.cpp)
+set(BWD_INTERFACES_SRCS hstu_attention_no_group_backward_bf16.cpp
+                        hstu_attention_no_group_forward_bf16.cpp)
+add_executable(${EXAMPLE_HSTU_ATTENTION_BWD} EXCLUDE_FROM_ALL example_hstu_attention_bwd.cpp)
+target_include_directories(${EXAMPLE_HSTU_ATTENTION_BWD} PRIVATE ${CMAKE_CURRENT_LIST_DIR})
+target_sources(${EXAMPLE_HSTU_ATTENTION_BWD} PRIVATE ${BWD_INTERFACES_SRCS} ${BWD_INSTANCE_SRCS} ${FWD_BF16_INSTANCE_SRCS})
+
+set(EXAMPLE_HSTU_ATTENTION_BWD_COMPILE_OPTIONS)
+list(APPEND EXAMPLE_HSTU_ATTENTION_BWD_COMPILE_OPTIONS -Wno-undefined-func-template -Wno-float-equal -DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=3)
+
+if(GPU_TARGETS MATCHES "gfx95" AND NOT GPU_TARGETS MATCHES "gfx94" AND NOT GPU_TARGETS MATCHES "gfx90")
+    ## disable slp-vectorize to improve pipelining performance on gfx950 (mirror fwd)
+    list(APPEND EXAMPLE_HSTU_ATTENTION_BWD_COMPILE_OPTIONS -DBUILD_HSTU_FOR_GFX95_ONLY -fno-slp-vectorize)
+endif()
+
+target_compile_options(${EXAMPLE_HSTU_ATTENTION_BWD} PRIVATE ${EXAMPLE_HSTU_ATTENTION_BWD_COMPILE_OPTIONS})
+
 # TODO: we have to turn off this global prop, otherwise the progress bar generated
 # by cmake will print too many files, execvp: /bin/sh: Argument list too long
 # however, this property may affect global
