@@ -5,6 +5,7 @@
 
 #include <hip/hip_runtime.h>
 #include "ck_tile/core.hpp"
+#include "hstu_block_masking.hpp"
 
 // HSTU attention backward — kernel layer (DESIGN §1.1).
 //
@@ -74,6 +75,12 @@ struct HstuAttentionBwdDQDKDVKernel
         float alpha;
         float scale_p;
 
+        // HSTU mask params (M2). num_targets_ptr is per-batch (int32); null => num_target=0.
+        const void* num_targets_ptr;
+        index_t contextual_seqlen;
+        index_t max_attn_len; // == window_size (local_len)
+        index_t min_full_attn_seqlen;
+
         index_t stride_q;
         index_t stride_k;
         index_t stride_v;
@@ -113,6 +120,10 @@ struct HstuAttentionBwdDQDKDVKernel
                                                   index_t nhead_ratio_qk,
                                                   float alpha,
                                                   float scale_p,
+                                                  const void* num_targets_ptr,
+                                                  index_t contextual_seqlen,
+                                                  index_t max_attn_len,
+                                                  index_t min_full_attn_seqlen,
                                                   index_t stride_q,
                                                   index_t stride_k,
                                                   index_t stride_v,
@@ -150,6 +161,10 @@ struct HstuAttentionBwdDQDKDVKernel
         k.nhead_ratio_qk      = nhead_ratio_qk;
         k.alpha               = alpha;
         k.scale_p             = scale_p;
+        k.num_targets_ptr     = num_targets_ptr;
+        k.contextual_seqlen   = contextual_seqlen;
+        k.max_attn_len        = max_attn_len;
+        k.min_full_attn_seqlen = min_full_attn_seqlen;
         k.stride_q            = stride_q;
         k.stride_k            = stride_k;
         k.stride_v            = stride_v;
@@ -307,9 +322,36 @@ struct HstuAttentionBwdDQDKDVKernel
             dq_acc_dram, make_tuple(number<HstuPipeline::kM0>{}, number<HstuPipeline::kQKHeaddim>{}),
             {0, 0});
 
-        // M1: no mask (GenericAttentionMask<false>; trivial GetTileRangeAlongY ->
-        // (0, seqlen_q)). HSTU 5-factor mask is M2.
-        auto mask = GenericAttentionMask<false>{kargs.seqlen_q, kargs.seqlen_kv};
+        // Build the HSTU mask identically to fwd/reference (self-attention; M2 batched).
+        // is_tile_in_first_split=true (conservative: disables the IsFullTileInsideMask
+        // fast-path so every edge tile is per-pixel checked; the tile-level first-split
+        // optimization is a later perf item, and IsTokenPairInsideMask is self-contained).
+        const int num_target =
+            (kargs.num_targets_ptr != nullptr)
+                ? reinterpret_cast<const int32_t*>(kargs.num_targets_ptr)[i_batch]
+                : 0;
+        auto mask = [&]() {
+            if constexpr(FmhaMask::kUseLocal)
+            {
+                // clamp min_full like reference (reference_hstu_attention_bwd.hpp:177/198)
+                const int eff_min_full =
+                    (kargs.seqlen_q - num_target > kargs.min_full_attn_seqlen)
+                        ? kargs.min_full_attn_seqlen
+                        : (kargs.seqlen_q - num_target);
+                return make_hstu_self_attention_block_mask_with_local<FmhaMask>(
+                    /*is_tile_in_first_split=*/true,
+                    kargs.seqlen_q,
+                    kargs.contextual_seqlen,
+                    num_target,
+                    kargs.max_attn_len,
+                    eff_min_full);
+            }
+            else
+            {
+                return make_hstu_self_attention_block_mask_without_local<FmhaMask>(
+                    kargs.seqlen_q, kargs.contextual_seqlen, num_target);
+            }
+        }();
 
         auto [dk_acc_tile, dv_acc_tile] = HstuPipeline{}(q_dram_window,
                                                          k_dram_window,

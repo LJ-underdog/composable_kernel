@@ -63,16 +63,13 @@ struct batched_backward_dispatch
 
     using TC = HstuAttentionFwdTypeConfig<InOutDataType>;
 
+    template <typename Mask>
     static void RunSilu(HstuAttentionNoGroupBwdParams& param, hipStream_t stream)
     {
         // hdim64: head-dim padding never needed in M1 (pad value 0)
         constexpr ck_tile::index_t kPadHeadDimQ = 0;
         constexpr ck_tile::index_t kPadHeadDimV = 0;
         constexpr ck_tile::index_t occupancy    = 1;
-
-        // M1: no-mask only. GenericAttentionMask<false> -> GetTileRangeAlongY=(0,seqlen_q)
-        // and IsMasking=false (edge-tile masking compiles out). HSTU 5-factor mask is M2.
-        using Mask = ck_tile::GenericAttentionMask<false>;
 
         // ck_hstu TileFmhaBwdTraits<kPadHeadDimQ, kPadHeadDimV, BiasEnum, kHasBiasGrad, kBlockPerCu>
         using Traits = ck_tile::TileFmhaBwdTraits<kPadHeadDimQ,
@@ -207,21 +204,25 @@ struct batched_backward_dispatch
         {
             throw std::runtime_error("HSTU bwd: softmax path not implemented yet (M5)");
         }
-        else if constexpr(kUseCausal)
-        {
-            throw std::runtime_error("HSTU bwd: causal/mask path not implemented yet (M2)");
-        }
         else
         {
             // M3: jagged (variable-length) not implemented yet.
             if(param.is_jagged)
                 throw std::runtime_error("HSTU bwd: jagged path not implemented yet (M3)");
 
-            // M1: SiLU + no-mask. hdim64 only. (seqlen never padded — OOB via buffer_load)
+            // M1/M2: SiLU. hdim64 only. (seqlen never padded — OOB via buffer_load)
+            // M2: HSTU 5-factor mask (causal/window/contextual/min_full/num_target).
+            // kUseLocal selected at runtime by window_size>0 (mirrors fwd). kUseCausal=0 &
+            // window=0 -> NoLocal<false> with IsMasking=false (== M1 no-mask).
             if(param.hdim_qk != 64 || param.hdim_v != 64)
-                throw std::runtime_error("HSTU bwd M1 supports hdim_qk=hdim_v=64 only (M7)");
+                throw std::runtime_error("HSTU bwd M1/M2 supports hdim_qk=hdim_v=64 only (M7)");
 
-            RunSilu(param, stream);
+            const bool use_local = (param.window_size > 0);
+            BOOL_SWITCH(use_local, kUseLocal, [&] {
+                using Mask = typename ck_tile::
+                    HstuBlockMasking<false /*cross*/, kUseCausal, kUseLocal>::Type;
+                RunSilu<Mask>(param, stream);
+            });
         }
     }
 };

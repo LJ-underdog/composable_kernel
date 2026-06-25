@@ -262,6 +262,26 @@ struct HstuCrossAttentionBlockMaskWithLocal
 
         return false;
     }
+
+    // --- bwd additions (M2, DESIGN §3.1 方案A:纯加,不改 fwd 成员) ---
+    // GetTileRangeAlongY: KV-block -> attending Q-row range (transpose of GetTileRangeAlongX).
+    // M2 returns the conservative continuous superset = full Q scan (fallback B, §8.2-R3);
+    // correctness comes from per-pixel IsTokenPairInsideMask zeroing in STAGE2. Tightening = perf.
+    template <index_t YTile, index_t XTile>
+    CK_TILE_HOST_DEVICE constexpr auto
+    GetTileRangeAlongY(index_t /*i_x*/, number<YTile>, number<XTile>) const
+    {
+        return ck_tile::make_tuple(0, seqlen_q);
+    }
+
+    // IsEdgeTile: tile needs per-pixel masking iff it is not fully inside the mask.
+    template <index_t TileHeight, index_t TileWidth>
+    CK_TILE_DEVICE constexpr bool
+    IsEdgeTile(index_t i_tile_top, index_t i_tile_left, number<TileHeight>, number<TileWidth>) const
+    {
+        return !IsFullTileInsideMask(
+            i_tile_top, i_tile_left, number<TileWidth>{}, number<TileHeight>{});
+    }
 };
 
 template <bool kUseCausal>
@@ -497,6 +517,22 @@ struct HstuSelfAttentionBlockMaskWithLocal
 
         return false;
     }
+
+    // --- bwd additions (M2, DESIGN §3.1) ---
+    template <index_t YTile, index_t XTile>
+    CK_TILE_HOST_DEVICE constexpr auto
+    GetTileRangeAlongY(index_t /*i_x*/, number<YTile>, number<XTile>) const
+    {
+        return ck_tile::make_tuple(0, seqlen); // conservative full-Q-scan superset (§8.2-R3)
+    }
+
+    template <index_t TileHeight, index_t TileWidth>
+    CK_TILE_DEVICE constexpr bool
+    IsEdgeTile(index_t i_tile_top, index_t i_tile_left, number<TileHeight>, number<TileWidth>) const
+    {
+        return !IsFullTileInsideMask(
+            i_tile_top, i_tile_left, number<TileWidth>{}, number<TileHeight>{});
+    }
 };
 
 template <bool kUseCausal>
@@ -650,6 +686,22 @@ struct HstuCrossAttentionBlockMaskNoLocal
             return true;
         }
     };
+
+    // --- bwd additions (M2, DESIGN §3.1) ---
+    template <index_t YTile, index_t XTile>
+    CK_TILE_HOST_DEVICE constexpr auto
+    GetTileRangeAlongY(index_t /*i_x*/, number<YTile>, number<XTile>) const
+    {
+        return ck_tile::make_tuple(0, seqlen_q); // conservative full-Q-scan superset (§8.2-R3)
+    }
+
+    template <index_t TileHeight, index_t TileWidth>
+    CK_TILE_DEVICE constexpr bool
+    IsEdgeTile(index_t i_tile_top, index_t i_tile_left, number<TileHeight>, number<TileWidth>) const
+    {
+        return !IsFullTileInsideMask(
+            i_tile_top, i_tile_left, number<TileWidth>{}, number<TileHeight>{});
+    }
 };
 
 template <bool kUseCausal>
@@ -782,6 +834,22 @@ struct HstuSelfAttentionBlockMaskNoLocal
             return true;
         }
     };
+
+    // --- bwd additions (M2, DESIGN §3.1) ---
+    template <index_t YTile, index_t XTile>
+    CK_TILE_HOST_DEVICE constexpr auto
+    GetTileRangeAlongY(index_t /*i_x*/, number<YTile>, number<XTile>) const
+    {
+        return ck_tile::make_tuple(0, seqlen); // conservative full-Q-scan superset (§8.2-R3)
+    }
+
+    template <index_t TileHeight, index_t TileWidth>
+    CK_TILE_DEVICE constexpr bool
+    IsEdgeTile(index_t i_tile_top, index_t i_tile_left, number<TileHeight>, number<TileWidth>) const
+    {
+        return !IsFullTileInsideMask(
+            i_tile_top, i_tile_left, number<TileWidth>{}, number<TileHeight>{});
+    }
 };
 
 template <bool kIsCrossAttention, bool kUseCausal, bool kUseLocal>

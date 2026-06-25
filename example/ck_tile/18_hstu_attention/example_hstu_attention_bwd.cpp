@@ -156,6 +156,8 @@ bool run_no_group_hstu_bwd(const ck_tile::ArgParser& arg_parser)
     int max_target = 0;
     if(!num_targets.empty())
     {
+        // supplement to num_batch (kernel + reference index num_targets[i_batch])
+        supplement_array_by_last_element(num_targets, num_batch);
         for(int i = 0; i < num_batch; i++)
             max_target = std::max(max_target, num_targets[i]);
     }

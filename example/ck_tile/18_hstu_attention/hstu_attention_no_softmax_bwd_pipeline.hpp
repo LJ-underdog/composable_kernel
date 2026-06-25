@@ -410,6 +410,25 @@ struct HstuAttentionBwdDQDKDVPipelineKRKTRVR
                 });
             });
 
+            // STAGE 2 (M2): masked-out positions must be EXPLICITLY zeroed on SiLU path
+            // (silu(0)*scale_p=0 but dsilu(0)=0.5 != 0; -inf is forbidden -> NaN). On edge
+            // tiles, clear p & g where !IsTokenPairInsideMask. ds=dp*g then auto-zeros (g=0),
+            // so dV/dK/dQ get no contribution from masked pairs (matches reference dS=0).
+            if constexpr(FmhaMask::IsMasking)
+            {
+                if(mask.IsEdgeTile(
+                       seqlen_q_step, k_origin.at(number<0>{}), number<kM0>{}, number<kN0>{}))
+                {
+                    auto is_masked_out = [&](auto tile_idx) {
+                        const int row = seqlen_q_step + tile_idx.at(number<0>{});
+                        const int col = k_origin.at(number<0>{}) + tile_idx.at(number<1>{});
+                        return !mask.IsTokenPairInsideMask(row, col);
+                    };
+                    set_tile_if(p, type_convert<AccDataType>(0.0f), is_masked_out);
+                    set_tile_if(g, type_convert<AccDataType>(0.0f), is_masked_out);
+                }
+            }
+
             const auto p_gemm = cast_tile<GemmDataType>(p);
 
             // STAGE 3, P^T @ dO^T  Gemm1 -> dV
