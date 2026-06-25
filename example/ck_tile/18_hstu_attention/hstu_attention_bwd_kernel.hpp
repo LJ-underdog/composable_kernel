@@ -66,6 +66,14 @@ struct HstuAttentionBwdDQDKDVKernel
         void* dv_ptr;
         void* dq_acc_ptr; // float
 
+        // jagged (variable-length) mode (M3). When is_jagged: dim0=1 packed tensors,
+        // per-(batch) base offset = seq_*_offsets_ptr[i_batch]*seq_stride (token-major),
+        // and seqlen_{q,kv} are derived per batch from the offsets (the scalar
+        // seqlen_q/seqlen_kv below are then ignored). Batched mode: is_jagged=false.
+        bool is_jagged;
+        const void* seq_q_offsets_ptr;  // int32, size num_batch+1
+        const void* seq_kv_offsets_ptr; // int32, size num_batch+1 (== q offsets for self-attn)
+
         index_t seqlen_q;
         index_t seqlen_kv;
         index_t hdim_qk;
@@ -113,6 +121,9 @@ struct HstuAttentionBwdDQDKDVKernel
                                                   void* dk_ptr,
                                                   void* dv_ptr,
                                                   void* dq_acc_ptr,
+                                                  bool is_jagged,
+                                                  const void* seq_q_offsets_ptr,
+                                                  const void* seq_kv_offsets_ptr,
                                                   index_t seqlen_q,
                                                   index_t seqlen_kv,
                                                   index_t hdim_qk,
@@ -154,6 +165,9 @@ struct HstuAttentionBwdDQDKDVKernel
         k.dk_ptr              = dk_ptr;
         k.dv_ptr              = dv_ptr;
         k.dq_acc_ptr          = dq_acc_ptr;
+        k.is_jagged           = is_jagged;
+        k.seq_q_offsets_ptr   = seq_q_offsets_ptr;
+        k.seq_kv_offsets_ptr  = seq_kv_offsets_ptr;
         k.seqlen_q            = seqlen_q;
         k.seqlen_kv           = seqlen_kv;
         k.hdim_qk             = hdim_qk;
@@ -218,15 +232,52 @@ struct HstuAttentionBwdDQDKDVKernel
         const auto [i_tile_n, i_nhead, i_batch] = GetTileIndex();
         const index_t i_n0 = __builtin_amdgcn_readfirstlane(i_tile_n * HstuPipeline::kN0);
 
-        // Per-(batch) base offsets: i_batch*batch_stride.
-        const long_index_t batch_offset_q  = static_cast<long_index_t>(i_batch) * kargs.batch_stride_q;
-        const long_index_t batch_offset_k  = static_cast<long_index_t>(i_batch) * kargs.batch_stride_k;
-        const long_index_t batch_offset_v  = static_cast<long_index_t>(i_batch) * kargs.batch_stride_v;
-        const long_index_t batch_offset_do = static_cast<long_index_t>(i_batch) * kargs.batch_stride_do;
-        const long_index_t batch_offset_dk = static_cast<long_index_t>(i_batch) * kargs.batch_stride_dk;
-        const long_index_t batch_offset_dv = static_cast<long_index_t>(i_batch) * kargs.batch_stride_dv;
-        const long_index_t batch_offset_dq_acc =
-            static_cast<long_index_t>(i_batch) * kargs.batch_stride_dq_acc;
+        // Per-(batch) base offsets. Jagged (M3): dim0=1 packed tensors, base =
+        // seq_*_offsets_ptr[i_batch]*seq_stride (token-major, mirrors fwd kernel),
+        // and seqlen_{q,kv} are derived from the offsets so the rest of the kernel
+        // (windows, mask, OOB fill) is layout-agnostic. Batched: i_batch*batch_stride.
+        long_index_t batch_offset_q;
+        long_index_t batch_offset_k;
+        long_index_t batch_offset_v;
+        long_index_t batch_offset_do;
+        long_index_t batch_offset_dk;
+        long_index_t batch_offset_dv;
+        long_index_t batch_offset_dq_acc;
+
+        if(kargs.is_jagged)
+        {
+            const auto* q_offsets  = reinterpret_cast<const int32_t*>(kargs.seq_q_offsets_ptr);
+            const auto* kv_offsets = reinterpret_cast<const int32_t*>(kargs.seq_kv_offsets_ptr);
+            const long_index_t query_start = q_offsets[i_batch];
+            const long_index_t key_start   = kv_offsets[i_batch];
+
+            batch_offset_q      = query_start * kargs.stride_q;
+            batch_offset_k      = key_start * kargs.stride_k;
+            batch_offset_v      = key_start * kargs.stride_v;
+            batch_offset_do     = query_start * kargs.stride_do;
+            batch_offset_dk     = key_start * kargs.stride_dk;
+            batch_offset_dv     = key_start * kargs.stride_dv;
+            batch_offset_dq_acc = query_start * kargs.stride_dq_acc;
+
+            // per-batch sequence lengths (token-major packed); overrides the scalar kargs
+            kargs.seqlen_q  = q_offsets[i_batch + 1] - q_offsets[i_batch];
+            kargs.seqlen_kv = kv_offsets[i_batch + 1] - kv_offsets[i_batch];
+        }
+        else
+        {
+            batch_offset_q      = static_cast<long_index_t>(i_batch) * kargs.batch_stride_q;
+            batch_offset_k      = static_cast<long_index_t>(i_batch) * kargs.batch_stride_k;
+            batch_offset_v      = static_cast<long_index_t>(i_batch) * kargs.batch_stride_v;
+            batch_offset_do     = static_cast<long_index_t>(i_batch) * kargs.batch_stride_do;
+            batch_offset_dk     = static_cast<long_index_t>(i_batch) * kargs.batch_stride_dk;
+            batch_offset_dv     = static_cast<long_index_t>(i_batch) * kargs.batch_stride_dv;
+            batch_offset_dq_acc = static_cast<long_index_t>(i_batch) * kargs.batch_stride_dq_acc;
+        }
+
+        // jagged: grid.x is sized for the largest sequence, so KV tiles past this
+        // batch's seqlen_kv have no work. (Batched grid is exact -> never triggers.)
+        if(i_n0 >= kargs.seqlen_kv)
+            return;
 
         const QDataType* q_ptr = reinterpret_cast<const QDataType*>(kargs.q_ptr) +
                                  static_cast<long_index_t>(i_nhead) * kargs.nhead_stride_q +

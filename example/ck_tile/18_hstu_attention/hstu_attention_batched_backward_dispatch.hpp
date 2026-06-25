@@ -130,6 +130,11 @@ struct batched_backward_dispatch
                                        param.dk_ptr,
                                        param.dv_ptr,
                                        param.dq_acc_ptr,
+                                       param.is_jagged,
+                                       param.seq_q_offsets_ptr,
+                                       // self-attention: kv offsets == q offsets (mirrors fwd)
+                                       param.is_cross_attention ? param.seq_kv_offsets_ptr
+                                                                : param.seq_q_offsets_ptr,
                                        param.seqlen_q,
                                        param.seqlen_kv,
                                        param.hdim_qk,
@@ -164,14 +169,21 @@ struct batched_backward_dispatch
                                        param.batch_stride_dq_acc);
 
         // zero the float dq_acc workspace before atomic accumulation. Batched layout
-        // is [num_batch, sq, h, hdim]; dim0 stride (batch_stride_dq_acc) is the
-        // per-batch element count.
-        const size_t dq_acc_elems = static_cast<size_t>(param.num_batch) *
-                                    static_cast<size_t>(param.batch_stride_dq_acc);
+        // is [num_batch, sq, h, hdim]; jagged is the dim0=1 packed [1, ΣL, h, hdim]
+        // whose dim0 stride (batch_stride_dq_acc) is the full element count.
+        const size_t dq_acc_elems =
+            param.is_jagged
+                ? static_cast<size_t>(param.batch_stride_dq_acc)
+                : static_cast<size_t>(param.num_batch) *
+                      static_cast<size_t>(param.batch_stride_dq_acc);
         HIP_CHECK_ERROR(hipMemsetAsync(
             param.dq_acc_ptr, 0, dq_acc_elems * sizeof(typename TC::GemmAccDataType), stream));
 
-        dim3 grid = Kernel::GridSize(param.num_batch, param.num_head, param.seqlen_kv);
+        // jagged: grid.x must cover the largest per-batch seqlen_kv (== max_seqlen_q
+        // for self-attention); KV tiles past a given batch's length early-exit.
+        const ck_tile::index_t grid_seqlen_kv =
+            param.is_jagged ? param.max_seqlen_q : param.seqlen_kv;
+        dim3 grid = Kernel::GridSize(param.num_batch, param.num_head, grid_seqlen_kv);
         dim3 block = Kernel::BlockSize();
         constexpr ck_tile::index_t kBlockPerCu = Kernel::kBlockPerCu;
 
@@ -196,6 +208,10 @@ struct batched_backward_dispatch
 
     static void Run(HstuAttentionNoGroupBwdParams& param, hipStream_t stream)
     {
+        // M3: jagged (variable-length) is handled by the same SiLU MAIN kernel — only
+        // the per-batch base offset / seqlen differ (selected at runtime by
+        // param.is_jagged inside the kernel + MakeKargs above). No separate instance.
+
         if constexpr(kIsDeterministic)
         {
             throw std::runtime_error("HSTU bwd: deterministic path not implemented yet (M6)");
@@ -206,10 +222,6 @@ struct batched_backward_dispatch
         }
         else
         {
-            // M3: jagged (variable-length) not implemented yet.
-            if(param.is_jagged)
-                throw std::runtime_error("HSTU bwd: jagged path not implemented yet (M3)");
-
             // M1/M2: SiLU. hdim64 only. (seqlen never padded — OOB via buffer_load)
             // M2: HSTU 5-factor mask (causal/window/contextual/min_full/num_target).
             // kUseLocal selected at runtime by window_size>0 (mirrors fwd). kUseCausal=0 &

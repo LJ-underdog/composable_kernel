@@ -92,7 +92,8 @@ auto create_args(int argc, char* argv[])
         .insert("nhead", "2", "number of heads")
         .insert("hdim_qk", "64", "headdim size of Q/K")
         .insert("hdim_v", "64", "headdim size of V/O")
-        .insert("seqlens", "128", "uih seqlen for query tensor (batched: single value)")
+        .insert("seqlens", "128", "uih seqlen for query tensor (batched: single value; jagged: comma list, supplemented to num_batch)")
+        .insert("jagged", "0", "variable-length (jagged) packed mode: q/k/v/dO/dQ/dK/dV are [1, sum(seqlen), h, d] with cu_seqlens offsets")
         .insert("softmax", "0", "use softmax activation (M0: SiLU only, 0)")
         .insert("causal", "0", "enable causal mask (M0: no-mask, 0)")
         .insert("local_len", "0", "diagonal window length; 0 disables")
@@ -134,6 +135,7 @@ bool run_no_group_hstu_bwd(const ck_tile::ArgParser& arg_parser)
     const int hdim_v       = arg_parser.get_int("hdim_v");
     const bool use_softmax = static_cast<bool>(arg_parser.get_int("softmax"));
     const bool use_causal  = static_cast<bool>(arg_parser.get_int("causal"));
+    const bool is_jagged   = static_cast<bool>(arg_parser.get_int("jagged"));
 
     const float in_alpha      = arg_parser.get_float("alpha");
     const float attn_scale    = arg_parser.get_float("attn_scale");
@@ -149,9 +151,14 @@ bool run_no_group_hstu_bwd(const ck_tile::ArgParser& arg_parser)
     std::vector<int> seq_lengths_q = get_integers_from_string(arg_parser.get_str("seqlens"));
 
     HSTU_CHECK(!seq_lengths_q.empty(), "sequence lengths of q should be defined!");
-    HSTU_CHECK(seq_lengths_q.size() == 1, "batched harness expects a single seqlen value!");
+    if(!is_jagged)
+        HSTU_CHECK(seq_lengths_q.size() == 1, "batched harness expects a single seqlen value!");
 
-    const bool is_cross_attention = false; // M2: self-attention only
+    const bool is_cross_attention = false; // M3: self-attention only
+
+    // jagged accepts a per-batch comma list; supplement to num_batch (mirrors fwd harness)
+    if(is_jagged)
+        supplement_array_by_last_element(seq_lengths_q, num_batch);
 
     int max_target = 0;
     if(!num_targets.empty())
@@ -164,22 +171,43 @@ bool run_no_group_hstu_bwd(const ck_tile::ArgParser& arg_parser)
 
     // max uih seqlen over batches (== seq_lengths_q[0] in batched mode)
     int max_uih_seqlen_q = 0;
-    for(int i = 0; i < 1; i++)
+    for(int i = 0; i < (is_jagged ? num_batch : 1); i++)
         max_uih_seqlen_q = std::max(max_uih_seqlen_q, seq_lengths_q[i]);
 
     // max_seqlen_q drives scale_p (=1/max_seqlen_q) identically on GPU and reference.
     const int max_seqlen_q  = max_uih_seqlen_q + max_target + contextual_seqlen;
     const int max_seqlen_kv = max_seqlen_q; // self-attention
 
-    const int phy_seqlen_q  = max_seqlen_q;
-    const int phy_seqlen_kv = max_seqlen_kv;
+    // Build jagged cu_seqlens offsets (token-major packed). Self-attention: kv == q.
+    // Per-batch physical seqlen includes num_target + contextual (mirrors fwd harness).
+    std::vector<int> seq_offsets_q;
+    int phy_seqlen_q  = 0;
+    int phy_seqlen_kv = 0;
+    if(is_jagged)
+    {
+        seq_offsets_q.push_back(0);
+        for(int i = 0; i < num_batch; i++)
+        {
+            const int batch_seqlen = seq_lengths_q[i] +
+                                     (num_targets.empty() ? 0 : num_targets[i]) + contextual_seqlen;
+            phy_seqlen_q += batch_seqlen;
+            seq_offsets_q.push_back(phy_seqlen_q);
+        }
+        phy_seqlen_kv = phy_seqlen_q; // self-attention
+    }
+    else
+    {
+        phy_seqlen_q  = max_seqlen_q;
+        phy_seqlen_kv = max_seqlen_kv;
+    }
+    const std::vector<int>& seq_offsets_kv = seq_offsets_q; // self-attention
 
-    // dim0 of the packed tensors: num_batch (batched mode).
-    const int batches_for_alloc = num_batch;
+    // dim0 of the packed tensors: 1 for jagged (ΣL along dim1), num_batch otherwise.
+    const int batches_for_alloc = is_jagged ? 1 : num_batch;
 
     using CompDataType = typename HstuAttentionFwdTypeConfig<InOutDataType>::CompDataType;
 
-    // ---- host tensors --------------------------------------------------------
+    // ---- host tensors (dim0 = 1 packed when jagged) --------------------------
     ck_tile::HostTensor<InOutDataType> q_host(
         std::array<ck_tile::index_t, 4>{batches_for_alloc, phy_seqlen_q, num_head, hdim_qk});
     ck_tile::HostTensor<InOutDataType> k_host(
@@ -234,6 +262,9 @@ bool run_no_group_hstu_bwd(const ck_tile::ArgParser& arg_parser)
     ck_tile::DeviceMem dv_dev(dv_host.get_element_space_size_in_bytes());
     ck_tile::DeviceMem num_targets_dev(std::max<size_t>(num_targets.size(), 1) * sizeof(int));
 
+    // jagged cu_seqlens offsets (size num_batch+1); allocate >=1 elem so batched is benign
+    ck_tile::DeviceMem seq_offsets_q_dev(std::max<size_t>(seq_offsets_q.size(), 1) * sizeof(int));
+
     // float dQ accumulation workspace (atomic path, nsplits=1; same packed layout as dQ)
     const size_t dq_acc_elems =
         static_cast<size_t>(batches_for_alloc) * phy_seqlen_q * num_head * hdim_qk;
@@ -245,6 +276,8 @@ bool run_no_group_hstu_bwd(const ck_tile::ArgParser& arg_parser)
     do_dev.ToDevice(do_host.data());
     if(!num_targets.empty())
         num_targets_dev.ToDevice(num_targets.data());
+    if(is_jagged)
+        seq_offsets_q_dev.ToDevice(seq_offsets_q.data());
 
     const float scale_s = (in_alpha != 0.f) ? in_alpha : 1.0f / std::sqrt(static_cast<float>(hdim_qk));
 
@@ -255,12 +288,12 @@ bool run_no_group_hstu_bwd(const ck_tile::ArgParser& arg_parser)
     {
         HstuAttentionNoGroupFwdParams fp;
         fp.is_cross_attention = is_cross_attention;
-        fp.is_jagged          = false;
+        fp.is_jagged          = is_jagged;
         fp.num_batch          = num_batch;
-        fp.seqlen_q           = phy_seqlen_q;
-        fp.seqlen_kv          = phy_seqlen_kv;
-        fp.seq_q_offsets_ptr  = nullptr;
-        fp.seq_kv_offsets_ptr = nullptr;
+        fp.seqlen_q           = phy_seqlen_q;  // jagged: ignored (per-batch via offsets)
+        fp.seqlen_kv          = phy_seqlen_kv; // jagged: ignored
+        fp.seq_q_offsets_ptr  = is_jagged ? seq_offsets_q_dev.GetDeviceBuffer() : nullptr;
+        fp.seq_kv_offsets_ptr = is_jagged ? seq_offsets_q_dev.GetDeviceBuffer() : nullptr;
         fp.max_seqlen_q       = max_seqlen_q;
         fp.q_ptr              = q_dev.GetDeviceBuffer();
         fp.k_ptr              = k_dev.GetDeviceBuffer();
@@ -310,12 +343,12 @@ bool run_no_group_hstu_bwd(const ck_tile::ArgParser& arg_parser)
     {
         HstuAttentionNoGroupBwdParams bp{};
         bp.is_cross_attention = is_cross_attention;
-        bp.is_jagged          = false;
+        bp.is_jagged          = is_jagged;
         bp.num_batch          = num_batch;
-        bp.seqlen_q           = phy_seqlen_q;
-        bp.seqlen_kv          = phy_seqlen_kv;
-        bp.seq_q_offsets_ptr  = nullptr;
-        bp.seq_kv_offsets_ptr = nullptr;
+        bp.seqlen_q           = phy_seqlen_q;  // jagged: ignored (per-batch via offsets)
+        bp.seqlen_kv          = phy_seqlen_kv; // jagged: ignored
+        bp.seq_q_offsets_ptr  = is_jagged ? seq_offsets_q_dev.GetDeviceBuffer() : nullptr;
+        bp.seq_kv_offsets_ptr = is_jagged ? seq_offsets_q_dev.GetDeviceBuffer() : nullptr;
         bp.max_seqlen_q       = max_seqlen_q; // scale_p = attn_scale ? attn_scale : 1/max_seqlen_q
         bp.q_ptr              = q_dev.GetDeviceBuffer();
         bp.k_ptr              = k_dev.GetDeviceBuffer();
@@ -396,14 +429,15 @@ bool run_no_group_hstu_bwd(const ck_tile::ArgParser& arg_parser)
 
         const std::vector<int> empty_offsets; // batched mode: no jagged offsets
 
-        const std::vector<int>& ref_q_offsets  = empty_offsets;
-        const std::vector<int>& ref_kv_offsets = empty_offsets;
+        // jagged: reference takes dim0=1 packed tensors + cu_seqlens (kv == q for self-attn).
+        const std::vector<int>& ref_q_offsets  = is_jagged ? seq_offsets_q : empty_offsets;
+        const std::vector<int>& ref_kv_offsets = is_jagged ? seq_offsets_kv : empty_offsets;
 
-        BOOL_SWITCH_2(use_softmax, kUseSoftmax, use_causal, kUseCausal, [&] {
+        BOOL_SWITCH_3(is_jagged, kIsJagged, use_softmax, kUseSoftmax, use_causal, kUseCausal, [&] {
             ck_tile::reference_no_group_hstu_attention_bwd<InOutDataType,
                                                            GemmAccDataType,
                                                            CompDataType,
-                                                           false,
+                                                           kIsJagged,
                                                            kUseSoftmax,
                                                            kUseCausal>::Run(is_cross_attention,
                                                                             q_host,
