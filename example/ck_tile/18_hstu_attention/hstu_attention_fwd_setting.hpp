@@ -13,7 +13,7 @@ using WarpTile_16x16x16 = ck_tile::sequence<16, 16, 16>;
 using WarpTile_16x16x32 = ck_tile::sequence<16, 16, 32>;
 using WarpTile_32x32x16 = ck_tile::sequence<32, 32, 16>;
 
-#if !defined(BUILD_HSTU_FOR_GFX95_ONLY)
+#if !defined(BUILD_HSTU_FOR_GFX95)
 template <ck_tile::index_t MaxK, ck_tile::index_t MTile = 0>
 struct HstuAttentionNoSoftmaxFwdBlockTile;
 
@@ -239,7 +239,7 @@ template struct HstuAttentionWithSoftmaxFwdTileSetting<256, 64>;
 template struct HstuAttentionWithSoftmaxFwdTileSetting<256, 128>;
 #endif
 
-#if defined(BUILD_HSTU_FOR_GFX95_ONLY)
+#if defined(BUILD_HSTU_FOR_GFX95)
 template <ck_tile::index_t MaxK, ck_tile::index_t MTile = 0>
 struct HstuAttentionNoSoftmaxFwdBlockTile;
 
@@ -465,22 +465,3 @@ template struct HstuAttentionWithSoftmaxFwdTileSetting<256, 64>;
 template struct HstuAttentionWithSoftmaxFwdTileSetting<256, 128>;
 
 #endif
-
-static int get_hstu_attention_fwd_mtile(int num_batches, int num_heads, int max_seqlen_q)
-{
-    int num_CUs  = get_number_of_cu();
-    auto ceildiv = [](int a, int b) { return (a + b - 1) / b; };
-
-    if(max_seqlen_q <= 64)
-        return 64;
-
-    int nbatch_nhead_mblocks = num_batches * num_heads * ceildiv(max_seqlen_q, 128);
-
-    // assuming each CU is assigned two work-groups
-    if(nbatch_nhead_mblocks >= static_cast<int>(0.85f * num_CUs * 2.0f))
-        return 128;
-
-    // currently, only hdim-128 actually uses mtile-64, for other hdim, the settings for
-    // mtile-64 can be added through tuning/verification
-    return 64;
-};

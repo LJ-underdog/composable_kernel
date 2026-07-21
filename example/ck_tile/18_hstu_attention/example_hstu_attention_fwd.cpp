@@ -2,9 +2,7 @@
 // Copyright (c) 2018-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 #include <array>
-#include <cstring>
-#include <functional>
-#include <numeric>
+#include <string>
 #include <ostream>
 #include <string>
 #include <tuple>
@@ -30,43 +28,7 @@
 #include "hstu_attention_host_util.hpp"
 #include "hstu_attention_api.hpp"
 
-template <typename T>
-void dumpBufferToFile(const char* fileName, T* data, size_t dataNumItems)
-{
-    std::ofstream outFile(fileName, std::ios::binary);
-    if(outFile)
-    {
-        outFile.write(reinterpret_cast<char*>(data), dataNumItems * sizeof(T));
-        outFile.close();
-        printf("Write output to file %s\n", fileName);
-    }
-    else
-    {
-        printf("Could not open file %s for writing\n", fileName);
-    }
-}
-
-template <typename T>
-void readDataToBufferFromFile(T* data, size_t dataNumItems, const std::string& fileName)
-{
-    std::ifstream infile(fileName, std::ios::binary);
-    if(infile)
-    {
-        try
-        {
-            infile.read(reinterpret_cast<char*>(data), dataNumItems * sizeof(T));
-            infile.close();
-        }
-        catch(const std::runtime_error& e)
-        {
-            throw e;
-        };
-    }
-    else
-    {
-        throw std::runtime_error("could not open the file for reading");
-    }
-}
+#include "example_helper.hpp"
 
 template <typename T>
 std::ostream& operator<<(std::ostream& os, const std::vector<T>& v)
@@ -130,80 +92,6 @@ auto create_args(int argc, char* argv[])
     return std::make_tuple(result, arg_parser);
 }
 
-static std::vector<int> get_integers_from_string(std::string srcStr)
-{
-    std::vector<int> integers;
-    std::size_t pos = 0;
-    std::size_t new_pos;
-
-    new_pos = srcStr.find(',', pos);
-    while(new_pos != std::string::npos)
-    {
-        std::string sliceStr = srcStr.substr(pos, new_pos - pos);
-
-        int len = std::stoi(sliceStr);
-
-        integers.push_back(len);
-
-        pos     = new_pos + 1;
-        new_pos = srcStr.find(',', pos);
-    };
-
-    std::string sliceStr = srcStr.substr(pos);
-
-    if(!sliceStr.empty())
-    {
-        int len = std::stoi(sliceStr);
-
-        integers.push_back(len);
-    };
-
-    return (integers);
-};
-
-static std::vector<float> get_floats_from_string(std::string srcStr)
-{
-    std::vector<float> values;
-    std::size_t pos = 0;
-    std::size_t new_pos;
-
-    new_pos = srcStr.find(',', pos);
-    while(new_pos != std::string::npos)
-    {
-        std::string sliceStr = srcStr.substr(pos, new_pos - pos);
-
-        float val = std::stof(sliceStr);
-
-        values.push_back(val);
-
-        pos     = new_pos + 1;
-        new_pos = srcStr.find(',', pos);
-    };
-
-    std::string sliceStr = srcStr.substr(pos);
-
-    if(!sliceStr.empty())
-    {
-        float val = std::stof(sliceStr);
-
-        values.push_back(val);
-    };
-
-    return (values);
-};
-
-template <typename T>
-void supplement_array_by_last_element(std::vector<T>& arr, int target_num_elements)
-{
-    if(static_cast<int>(arr.size()) < target_num_elements)
-    {
-        T last_val = arr.back();
-
-        for(int i = arr.size(); i < target_num_elements; i++)
-            arr.push_back(last_val);
-    };
-};
-
 // threshold for different dtypes
 template <typename DataType>
 auto get_elimit()
@@ -223,7 +111,7 @@ auto get_elimit<ck_tile::bf16_t>()
 }
 
 template <typename InOutDataType>
-bool run_no_group_hstu(const ck_tile::ArgParser& arg_parser, bool is_jagged)
+bool run_no_group_hstu_forward(const ck_tile::ArgParser& arg_parser, bool is_jagged)
 {
     using CompDataType = typename HstuAttentionFwdTypeConfig<InOutDataType>::CompDataType;
 
@@ -389,6 +277,18 @@ bool run_no_group_hstu(const ck_tile::ArgParser& arg_parser, bool is_jagged)
         phy_seqlen_kv = max_seqlen_kv;
     };
 
+    int min_seqlen_q  = std::numeric_limits<int>::max();
+    int min_seqlen_kv = std::numeric_limits<int>::max();
+
+    if(is_jagged)
+    {
+        for(int i = 0; i < num_batch; i++)
+        {
+            min_seqlen_q  = min(min_seqlen_q, seq_offsets_q[i + 1] - seq_offsets_q[i]);
+            min_seqlen_kv = min(min_seqlen_kv, seq_offsets_kv[i + 1] - seq_offsets_kv[i]);
+        };
+    };
+
     long total_flops = 0;
 
     // estimate the total flops occurred, ignoring the scaling and SiLu
@@ -490,6 +390,9 @@ bool run_no_group_hstu(const ck_tile::ArgParser& arg_parser, bool is_jagged)
         params.seq_q_offsets_ptr  = seq_offsets_q_dev.GetDeviceBuffer();
         params.seq_kv_offsets_ptr = seq_offsets_kv_dev.GetDeviceBuffer();
         params.max_seqlen_q       = max_seqlen_q;
+        params.max_seqlen_kv      = max_seqlen_kv;
+        params.min_seqlen_q       = min_seqlen_q;
+        params.min_seqlen_kv      = min_seqlen_kv;
         params.q_ptr              = q_dev.GetDeviceBuffer();
         params.k_ptr              = k_dev.GetDeviceBuffer();
         params.v_ptr              = v_dev.GetDeviceBuffer();
@@ -690,7 +593,7 @@ bool run_no_group_hstu(const ck_tile::ArgParser& arg_parser, bool is_jagged)
 }
 
 template <typename InOutDataType>
-bool run_group_hstu(const ck_tile::ArgParser& arg_parser, int num_group)
+bool run_group_hstu_forward(const ck_tile::ArgParser& arg_parser, int num_group)
 {
     using CompDataType = typename HstuAttentionFwdTypeConfig<InOutDataType>::CompDataType;
 
@@ -746,6 +649,12 @@ bool run_group_hstu(const ck_tile::ArgParser& arg_parser, int num_group)
 
     str_of_integers                                 = arg_parser.get_str("g_max_seqlens_kv");
     std::vector<int> group_input_max_uih_seqlens_kv = get_integers_from_string(str_of_integers);
+
+    // for self-attention, group_input_max_uih_seqlens_kv reuses group_input_max_uih_seqlens_q
+    if(!is_cross_attention)
+    {
+        group_input_max_uih_seqlens_kv = group_input_max_uih_seqlens_q;
+    };
 
     str_of_integers                           = arg_parser.get_str("g_context_lens");
     std::vector<int> group_contextual_seqlens = get_integers_from_string(str_of_integers);
@@ -847,11 +756,23 @@ bool run_group_hstu(const ck_tile::ArgParser& arg_parser, int num_group)
 
     for(int i_grp = 0; i_grp < num_group; i_grp++)
     {
+        int max_num_target = 0;
+
+        if(!num_targets.empty())
+        {
+            for(int i_batch = 0; i_batch < num_batch_per_group; i_batch++)
+            {
+                int i_global_batch = i_grp * num_batch_per_group + i_batch;
+
+                max_num_target = max(max_num_target, num_targets[i_global_batch]);
+            };
+        };
+
         group_max_seqlens_q[i_grp] =
-            group_max_uih_seqlens_q[i_grp] + group_contextual_seqlens[i_grp] + num_targets[i_grp];
+            group_max_uih_seqlens_q[i_grp] + group_contextual_seqlens[i_grp] + max_num_target;
         max_max_seqlen_q = max(max_max_seqlen_q, group_max_seqlens_q[i_grp]);
         group_max_seqlens_kv[i_grp] =
-            group_max_uih_seqlens_kv[i_grp] + group_contextual_seqlens[i_grp] + num_targets[i_grp];
+            group_max_uih_seqlens_kv[i_grp] + group_contextual_seqlens[i_grp] + max_num_target;
         max_max_seqlen_kv = max(max_max_seqlen_kv, group_max_seqlens_kv[i_grp]);
     };
 
@@ -895,6 +816,15 @@ bool run_group_hstu(const ck_tile::ArgParser& arg_parser, int num_group)
             phy_seqlen_kv += batch_seqlen;
             seq_offsets_kv.push_back(phy_seqlen_kv);
         }
+    };
+
+    int min_seqlen_q  = std::numeric_limits<int>::max();
+    int min_seqlen_kv = std::numeric_limits<int>::max();
+
+    for(int i = 0; i < num_batch; i++)
+    {
+        min_seqlen_q  = min(min_seqlen_q, seq_offsets_q[i + 1] - seq_offsets_q[i]);
+        min_seqlen_kv = min(min_seqlen_kv, seq_offsets_kv[i + 1] - seq_offsets_kv[i]);
     };
 
     long total_flops = 0;
@@ -998,6 +928,9 @@ bool run_group_hstu(const ck_tile::ArgParser& arg_parser, int num_group)
     params.seq_q_offsets_ptr  = seq_offsets_q_dev.GetDeviceBuffer();
     params.seq_kv_offsets_ptr = seq_offsets_kv_dev.GetDeviceBuffer();
     params.max_seqlen_q       = max_max_seqlen_q;
+    params.max_seqlen_kv      = max_max_seqlen_kv;
+    params.min_seqlen_q       = min_seqlen_q;
+    params.min_seqlen_kv      = min_seqlen_kv;
     params.q_ptr              = q_dev.GetDeviceBuffer();
     params.k_ptr              = k_dev.GetDeviceBuffer();
     params.v_ptr              = v_dev.GetDeviceBuffer();
@@ -1168,11 +1101,11 @@ int main(int argc, char* argv[])
     {
         if(data_type == "fp16")
         {
-            return run_group_hstu<ck_tile::half_t>(arg_parser, num_group) ? 0 : -2;
+            return run_group_hstu_forward<ck_tile::half_t>(arg_parser, num_group) ? 0 : -2;
         }
         else if(data_type == "bf16")
         {
-            return run_group_hstu<ck_tile::bf16_t>(arg_parser, num_group) ? 0 : -2;
+            return run_group_hstu_forward<ck_tile::bf16_t>(arg_parser, num_group) ? 0 : -2;
         }
     }
     else
@@ -1181,11 +1114,11 @@ int main(int argc, char* argv[])
 
         if(data_type == "fp16")
         {
-            return run_no_group_hstu<ck_tile::half_t>(arg_parser, is_jagged) ? 0 : -2;
+            return run_no_group_hstu_forward<ck_tile::half_t>(arg_parser, is_jagged) ? 0 : -2;
         }
         else if(data_type == "bf16")
         {
-            return run_no_group_hstu<ck_tile::bf16_t>(arg_parser, is_jagged) ? 0 : -2;
+            return run_no_group_hstu_forward<ck_tile::bf16_t>(arg_parser, is_jagged) ? 0 : -2;
         }
     };
 

@@ -58,10 +58,7 @@ struct HstuAttentionFwdTileSettingClass
     static constexpr index_t kQKHeaddim =
         BlockTile::at(number<5>{}); // total length of K0, used for pipeline that need load Q at
                                     // once (or repeately load Q as a whole tile)
-
-    static constexpr index_t kSubQKHeaddim = ceil_to_qualified_tile_length(kQKHeaddim);
-
-    static_assert(kSubQKHeaddim % kN1 == 0, "Check failed!");
+    static_assert((kN0 % kN0Sub == 0) && (kN0 % kK1 == 0), "Check failed!");
 };
 
 template <index_t kM_,       // tile size in seqlen_q dimension

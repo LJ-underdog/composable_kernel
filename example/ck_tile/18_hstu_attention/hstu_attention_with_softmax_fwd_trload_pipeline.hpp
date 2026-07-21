@@ -29,15 +29,14 @@ struct HstuAttentionWithSoftmaxFwdPipelineQRKSVSTrLoad
 
     static constexpr index_t kBlockSize = Problem::kBlockSize;
 
-    static constexpr index_t kM0           = HstuAttentionTileSetting::kM0;
-    static constexpr index_t kN0           = HstuAttentionTileSetting::kN0;
-    static constexpr index_t kN0Sub        = HstuAttentionTileSetting::kN0Sub;
-    static constexpr index_t kN1           = HstuAttentionTileSetting::kN1;
-    static constexpr index_t kK1           = HstuAttentionTileSetting::kK1;
-    static constexpr index_t kQKHeaddim    = HstuAttentionTileSetting::kQKHeaddim;
-    static constexpr index_t kSubQKHeaddim = HstuAttentionTileSetting::kSubQKHeaddim;
+    static constexpr index_t kM0        = HstuAttentionTileSetting::kM0;
+    static constexpr index_t kN0        = HstuAttentionTileSetting::kN0;
+    static constexpr index_t kN0Sub     = HstuAttentionTileSetting::kN0Sub;
+    static constexpr index_t kN1        = HstuAttentionTileSetting::kN1;
+    static constexpr index_t kK1        = HstuAttentionTileSetting::kK1;
+    static constexpr index_t kQKHeaddim = HstuAttentionTileSetting::kQKHeaddim;
 
-    static_assert(kSubQKHeaddim <= 256, "hdim bigger than 256 is not suitable for this pipeline!");
+    static_assert(kQKHeaddim <= 256, "hdim bigger than 256 is not suitable for this pipeline!");
 
     static_assert(Problem::kUseSoftmax == true, "This pipeline only works with using softmax");
 
@@ -73,7 +72,7 @@ struct HstuAttentionWithSoftmaxFwdPipelineQRKSVSTrLoad
 
     // used by NRepetitions2DEpilogue
     static constexpr index_t kGemm1SingleRepN =
-        Policy::template GetKVBlockGemmSingleRepN<Problem>();
+        Policy::template GetPVTBlockGemmSingleRepN<Problem>();
 
     static constexpr index_t kBlockPerCu = []() {
         if constexpr(Traits::kBlockPerCu != -1)
@@ -106,8 +105,6 @@ struct HstuAttentionWithSoftmaxFwdPipelineQRKSVSTrLoad
         }
     }();
 
-    static constexpr const char* name = "qr_hstu";
-
     using DropoutType = std::conditional_t<kHasDropout, BlockDropout, NullBlockDropout>;
 
     CK_TILE_DEVICE static constexpr ck_tile::index_t GetSmemSize()
@@ -120,25 +117,13 @@ struct HstuAttentionWithSoftmaxFwdPipelineQRKSVSTrLoad
               typename VDramBlockWindowTmp,
               typename BiasDramBlockWindowTmp,
               typename LSEorLSEaccDramBlockWindow,
-              typename QElementFunction,
-              typename BiasElementFunction,
-              typename LSEaccElementFunction,
-              typename SAccElementFunction,
-              typename PComputeElementFunction,
-              typename OAccElementFunction,
               typename HstuMask>
     CK_TILE_DEVICE auto
-    operator()(const QDramBlockWindowTmp& q_dram_block_window_tmp, // M0*kQKHeaddim tile
-               const QElementFunction& q_element_func,
-               const KDramBlockWindowTmp& k_dram_block_window_tmp,       // N0*kQKHeaddim tile
-               const VDramBlockWindowTmp& v_dram_block_window_tmp,       // N1*K1 tile
-               const BiasDramBlockWindowTmp& bias_dram_block_window_tmp, // M0*N0 tile
-               const BiasElementFunction& bias_element_func,
+    operator()(const QDramBlockWindowTmp& q_dram_block_window_tmp,           // M0*kQKHeaddim tile
+               const KDramBlockWindowTmp& k_dram_block_window_tmp,           // N0*kQKHeaddim tile
+               const VDramBlockWindowTmp& v_dram_block_window_tmp,           // N1*K1 tile
+               const BiasDramBlockWindowTmp& bias_dram_block_window_tmp,     // M0*N0 tile
                LSEorLSEaccDramBlockWindow& lse_or_lse_acc_dram_block_window, // M0 tile
-               const LSEaccElementFunction& lse_or_lse_acc_element_func,
-               const SAccElementFunction& s_acc_element_func,
-               const PComputeElementFunction& p_compute_element_func,
-               const OAccElementFunction& o_acc_element_func,
                index_t seqlen_k_start,
                index_t seqlen_k_end,
                HstuMask& mask,
@@ -176,7 +161,7 @@ struct HstuAttentionWithSoftmaxFwdPipelineQRKSVSTrLoad
         // Block GEMM
         constexpr auto gemm_0 = Policy::template GetQKBlockGemm<Problem>();
         constexpr auto gemm_1 =
-            Policy::template GetKVBlockGemm<Problem, true /*kPipelineUseTrLoad*/>();
+            Policy::template GetPVTBlockGemm<Problem, true /*kPipelineUseTrLoad*/>();
 
         // SaccBlockTile size is [kM0, kN0Sub]
         // PcompBlockTile size is [kM0, kN0]
@@ -203,7 +188,6 @@ struct HstuAttentionWithSoftmaxFwdPipelineQRKSVSTrLoad
         if(seqlen_k_end <= seqlen_k_start)
         {
             clear_tile(o_acc);
-            o_acc = tile_elementwise_in(o_acc_element_func, o_acc);
 
             if constexpr(!is_null_tile_window_v<LSEorLSEaccDramBlockWindow>)
             {
@@ -212,8 +196,7 @@ struct HstuAttentionWithSoftmaxFwdPipelineQRKSVSTrLoad
 
                 set_tile(lse_or_lse_acc, -numeric<CompDataType>::infinity());
 
-                store_tile(lse_or_lse_acc_dram_block_window,
-                           tile_elementwise_in(lse_or_lse_acc_element_func, lse_or_lse_acc));
+                store_tile(lse_or_lse_acc_dram_block_window, lse_or_lse_acc);
             }
 
             return o_acc;
@@ -345,8 +328,6 @@ struct HstuAttentionWithSoftmaxFwdPipelineQRKSVSTrLoad
         set_tile(m, -numeric<CompDataType>::infinity());
         clear_tile(l);
 
-        q_tile = tile_elementwise_in(q_element_func, q_tile);
-
         auto seqlen_k_curr = seqlen_k_start;
 
         constexpr index_t NumPrefetchV = 2;
@@ -388,8 +369,6 @@ struct HstuAttentionWithSoftmaxFwdPipelineQRKSVSTrLoad
                 // execute current unroll of gemm_0
                 gemm_0(sacc_tile, q_tile, k_lds_windows[number<i_n0 % NumKVLdsBuffers>{}]);
 
-                sacc_tile = tile_elementwise_in(s_acc_element_func, sacc_tile);
-
                 auto tmp_tile = cast_tile<CompDataType>(sacc_tile);
 
                 set_slice_tile(pcomp_tile,
@@ -406,8 +385,8 @@ struct HstuAttentionWithSoftmaxFwdPipelineQRKSVSTrLoad
                 const auto bias_tile = load_tile(bias_dram_window);
 
                 tile_elementwise_inout(
-                    [&scale_s, &bias_element_func](auto& x, const auto& y) {
-                        x = x * scale_s + type_convert<CompDataType>(bias_element_func(y));
+                    [&scale_s](auto& x, const auto& y) {
+                        x = x * scale_s + type_convert<CompDataType>(y);
                     },
                     pcomp_tile,
                     bias_tile);
@@ -556,7 +535,7 @@ struct HstuAttentionWithSoftmaxFwdPipelineQRKSVSTrLoad
                     randval_lds_ptr, seqlen_k_curr, pcomp_tile, null_randval_window);
             }
 
-            auto p = cast_tile<PDataType>(tile_elementwise_in(p_compute_element_func, pcomp_tile));
+            auto p = cast_tile<PDataType>(pcomp_tile);
 
             __builtin_amdgcn_sched_barrier(0x00000001);
 
@@ -618,8 +597,7 @@ struct HstuAttentionWithSoftmaxFwdPipelineQRKSVSTrLoad
                 lse_or_lse_acc(i_idx) = m_[i_idx] + log(l_[i_idx]);
             });
 
-            store_tile(lse_or_lse_acc_dram_block_window,
-                       tile_elementwise_in(lse_or_lse_acc_element_func, lse_or_lse_acc));
+            store_tile(lse_or_lse_acc_dram_block_window, lse_or_lse_acc);
         }
 
         constexpr auto o_spans = decltype(o_acc)::get_distributed_spans();
@@ -638,49 +616,7 @@ struct HstuAttentionWithSoftmaxFwdPipelineQRKSVSTrLoad
             });
         });
 
-        o_acc = tile_elementwise_in(o_acc_element_func, o_acc);
-
         return o_acc;
-    }
-
-    template <typename QDramBlockWindowTmp,
-              typename KDramBlockWindowTmp,
-              typename VDramBlockWindowTmp,
-              typename BiasDramBlockWindowTmp,
-              typename LSEorLSEaccDramBlockWindow,
-              typename HstuMask>
-    CK_TILE_DEVICE auto
-    operator()(const QDramBlockWindowTmp& q_dram_block_window_tmp,           // M0*kQKHeaddim tile
-               const KDramBlockWindowTmp& k_dram_block_window_tmp,           // N0*KQKHeaddim tile
-               const VDramBlockWindowTmp& v_dram_block_window_tmp,           // N1*K1 tile
-               const BiasDramBlockWindowTmp& bias_dram_block_window_tmp,     // M0*N0 tile
-               LSEorLSEaccDramBlockWindow& lse_or_lse_acc_dram_block_window, // M0 tile
-               index_t seqlen_k_start,
-               index_t seqlen_k_end,
-               HstuMask mask,
-               float scale_s, // scaling value exerted on the immediate Q@K result
-               float scale_p, // scaling value exerted on the SiLU result
-               void* smem_ptr,
-               DropoutType& dropout) const
-    {
-        return operator()(q_dram_block_window_tmp,
-                          identity{},
-                          k_dram_block_window_tmp,
-                          v_dram_block_window_tmp,
-                          bias_dram_block_window_tmp,
-                          identity{},
-                          lse_or_lse_acc_dram_block_window,
-                          identity{},
-                          identity{},
-                          identity{},
-                          identity{},
-                          seqlen_k_start,
-                          seqlen_k_end,
-                          mask,
-                          scale_s,
-                          scale_p,
-                          smem_ptr,
-                          dropout);
     }
 };
 

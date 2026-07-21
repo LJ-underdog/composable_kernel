@@ -4,13 +4,13 @@
 
 // The file is automatically generated, don't modify!
 // See the generator script
-// `ck_hstu/example/ck_tile/18_hstu_attention/generate_instances.py`
+// `composable_kernel/example/ck_tile/18_hstu_attention/generate_fwd_instances.py`
 
 #include <ck_tile/core/numeric/half.hpp>
 #include "hstu_attention_jagged_forward_dispatch.hpp"
 #include "hstu_attention_params.hpp"
 
-template void run_jagged_forward_causal_softmax_bias_dropout_dispatch<
+template void run_jagged_forward_dispatch<
     ck_tile::fp16_t,
     true,
     false,

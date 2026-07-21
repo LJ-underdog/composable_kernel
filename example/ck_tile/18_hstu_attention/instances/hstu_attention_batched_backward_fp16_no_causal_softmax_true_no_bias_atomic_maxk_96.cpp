@@ -4,7 +4,7 @@
 
 // The file is automatically generated, don't modify!
 // See the generator script
-// `ck_hstu/example/ck_tile/18_hstu_attention/generate_instances.py`
+// `composable_kernel/example/ck_tile/18_hstu_attention/generate_fwd_instances.py`
 
 #include <ck_tile/core/numeric/half.hpp>
 #include "hstu_attention_batched_backward_dispatch.hpp"

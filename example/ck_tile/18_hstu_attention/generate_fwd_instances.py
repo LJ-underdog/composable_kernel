@@ -27,7 +27,7 @@ HSTU_FORWARD_INSTANCE_TEMPLATE_INC = """
 """
 
 HSTU_FORWARD_INSTANCE_TEMPLATE = """
-{extern}template void run_{mode}_forward_causal_softmax_bias_dropout_dispatch<
+{extern}template void run_{mode}_forward_dispatch<
     {dtype},
     {has_causal},
     {use_softmax},
@@ -42,6 +42,11 @@ HSTU_FORWARD_INSTANCE_FNAME = (
     "{store_lse_or_not_str}_{has_or_no_bias_str}_{has_or_no_dropout_str}_{max_k_str}.cpp"
 )
 
+HSTU_FORWARD_INSTANCE_REF_FNAME = "hstu_attention_{mode}_forward_{dtype}_instances_ref.hpp"
+
+# Generic ref-filename template used by the backward (M0) generator, which passes
+# function="backward". fwd branch renamed the forward-specific one above; the bwd
+# generator still needs this generic form -> restored during merge.
 HSTU_INSTANCE_REF_FNAME = "hstu_attention_{mode}_{function}_{dtype}_instances_ref.hpp"
 
 BOOL_MAP = {True: "true", False: "false"}
@@ -99,7 +104,7 @@ def create_forward_instances(instance_dir: Path, headdims: List) -> None:
                     (True, True),
                     (False, False),
                 ]:
-                    for has_bias in [True, False]:
+                    for has_bias in [False]:
                         for has_dropout in [False]:
                             for max_k in headdims:
                                 fname = HSTU_FORWARD_INSTANCE_FNAME.format(
@@ -256,9 +261,8 @@ def create_backward_instances_ref(instance_dir: Path) -> None:
 def create_forward_instances_ref(instance_dir: Path, headdims: List) -> None:
     for mode in ["batched", "jagged", "group"]:
         for dtype in ["fp16", "bf16"]:
-            ref_fname = HSTU_INSTANCE_REF_FNAME.format(
+            ref_fname = HSTU_FORWARD_INSTANCE_REF_FNAME.format(
                 mode=mode,
-                function="forward",
                 dtype=dtype,
             )
             ref_fname_path = instance_dir / ref_fname
@@ -270,7 +274,7 @@ def create_forward_instances_ref(instance_dir: Path, headdims: List) -> None:
                 file.write(HSTU_COPYRIGHT_HEADER)
                 file.write(forward_instance_inc)
                 for max_k in headdims:
-                    for has_bias in [True, False]:
+                    for has_bias in [False]:
                         for has_dropout in [False]:
                             for has_causal in [True, False]:
                                 for use_softmax, store_lse in [

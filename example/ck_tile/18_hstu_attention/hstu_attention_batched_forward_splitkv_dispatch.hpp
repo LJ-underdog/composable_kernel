@@ -36,17 +36,15 @@ template <typename InOutDataType,
           bool kHasDropout,
           ck_tile::index_t MaxK,
           ck_tile::index_t MTile>
-struct batched_forward_splitkv_causal_softmax_bias_dropout_dispatch
+struct batched_forward_splitkv_dispatch
 {
-    static_assert(MTile == 64, "MTile must be 64 to get to fwd splitkv path!");
-
     using HstuAttentionFwdTileSetting =
         typename std::conditional_t<kUseSoftmax,
                                     HstuAttentionWithSoftmaxFwdTileSetting<MaxK, MTile>,
                                     HstuAttentionNoSoftmaxFwdTileSetting<MaxK, MTile>>::Type;
     using HstuAttentionCombineTileSetting = HstuAttentionFwdSplitKVCombineTileSetting<MaxK>::Type;
 
-#ifdef BUILD_HSTU_FOR_GFX95_ONLY
+#ifdef BUILD_HSTU_FOR_GFX95
     static constexpr bool use_trload_pipeline = true;
 #else
     static constexpr bool use_trload_pipeline = false;
@@ -254,7 +252,8 @@ struct batched_forward_splitkv_causal_softmax_bias_dropout_dispatch
                                         SplitkvWorkspace& ws,
                                         hipStream_t stream)
     {
-        ws.num_splits = get_suggested_num_splits(param.num_batch, param.num_head, param.seqlen_q);
+        ws.num_splits = get_suggested_num_splits(
+            param.num_batch, param.num_head, param.seqlen_q, param.seqlen_kv);
 
         // assume the workspace for o_acc is in compact shape of [num_batch, seqlen_q, num_head,
         // num_splits, hdim]
@@ -317,6 +316,7 @@ struct batched_forward_splitkv_causal_softmax_bias_dropout_dispatch
                                               param.seqlen_q,
                                               param.hdim_v,
                                               ws.num_splits,
+                                              true, // almost_invariant_seqlen
                                               has_minfull_attn_seqlen);
         dim3 kBlockSize                        = HstuKernel::BlockSize();
         constexpr ck_tile::index_t kBlockPerCu = HstuKernel::kBlockPerCu;
@@ -348,8 +348,9 @@ struct batched_forward_splitkv_causal_softmax_bias_dropout_dispatch
                                          param.hdim_v);
         }();
 
-        dim3 kGridSize  = HstuKernel::GridSize(param.num_batch, param.num_head, param.seqlen_q);
-        dim3 kBlockSize = HstuKernel::BlockSize();
+        dim3 kGridSize = HstuKernel::GridSize(
+            param.num_batch, param.num_head, param.seqlen_q, true /* almost_invariant_seqlen */);
+        dim3 kBlockSize                        = HstuKernel::BlockSize();
         constexpr ck_tile::index_t kBlockPerCu = HstuKernel::kBlockPerCu;
 
         (void)ck_tile::launch_kernel(

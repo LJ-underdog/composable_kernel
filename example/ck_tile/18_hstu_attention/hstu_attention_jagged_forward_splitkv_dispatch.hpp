@@ -27,6 +27,7 @@
 #include "hstu_attention_fwd_splitkv_kernel.hpp"
 #include "hstu_attention_fwd_splitkv_combine_kernel.hpp"
 #include "hstu_attention_splitkv_helper.hpp"
+#include "hstu_attention_host_util.hpp"
 
 template <typename InOutDataType,
           bool kUseCausal,
@@ -36,17 +37,15 @@ template <typename InOutDataType,
           bool kHasDropout,
           ck_tile::index_t MaxK,
           ck_tile::index_t MTile>
-struct jagged_forward_splitkv_causal_softmax_bias_dropout_dispatch
+struct jagged_forward_splitkv_dispatch
 {
-    static_assert(MTile == 64, "MTile must be 64 to get to fwd splitkv path!");
-
     using HstuAttentionFwdTileSetting =
         typename std::conditional_t<kUseSoftmax,
                                     HstuAttentionWithSoftmaxFwdTileSetting<MaxK, MTile>,
                                     HstuAttentionNoSoftmaxFwdTileSetting<MaxK, MTile>>::Type;
     using HstuAttentionCombineTileSetting = HstuAttentionFwdSplitKVCombineTileSetting<MaxK>::Type;
 
-#ifdef BUILD_HSTU_FOR_GFX95_ONLY
+#ifdef BUILD_HSTU_FOR_GFX95
     static constexpr bool use_trload_pipeline = true;
 #else
     static constexpr bool use_trload_pipeline = false;
@@ -245,8 +244,8 @@ struct jagged_forward_splitkv_causal_softmax_bias_dropout_dispatch
                                         SplitkvWorkspace& ws,
                                         hipStream_t stream)
     {
-        ws.num_splits =
-            get_suggested_num_splits(param.num_batch, param.num_head, param.max_seqlen_q);
+        ws.num_splits = get_suggested_num_splits(
+            param.num_batch, param.num_head, param.max_seqlen_q, param.max_seqlen_kv);
 
         // assume the workspace for o_acc is in compact shape of [num_batch, max_seqlen, num_head,
         // num_splits, hdim]
@@ -266,6 +265,8 @@ struct jagged_forward_splitkv_causal_softmax_bias_dropout_dispatch
             HIP_CHECK_ERROR(hipMallocAsync(&ws.lse_acc_ptr, workspace_bytes, stream));
         }
 
+        bool almost_invariant_seqlen = is_almost_invariant_seqlen(param);
+
         const auto kargs = [&] {
             return HstuKernel::MakeKargs(param.q_ptr,
                                          param.k_ptr,
@@ -283,6 +284,7 @@ struct jagged_forward_splitkv_causal_softmax_bias_dropout_dispatch
                                          param.num_head,
                                          param.scale_s,
                                          param.attn_scale,
+                                         almost_invariant_seqlen,
                                          param.seq_stride_q,
                                          param.seq_stride_k,
                                          param.seq_stride_v,
@@ -306,6 +308,7 @@ struct jagged_forward_splitkv_causal_softmax_bias_dropout_dispatch
                                               param.max_seqlen_q,
                                               param.hdim_v,
                                               ws.num_splits,
+                                              almost_invariant_seqlen,
                                               has_minfull_attn_seqlen);
         dim3 kBlockSize                        = HstuKernel::BlockSize();
         constexpr ck_tile::index_t kBlockPerCu = HstuKernel::kBlockPerCu;
@@ -320,6 +323,8 @@ struct jagged_forward_splitkv_causal_softmax_bias_dropout_dispatch
                                                SplitkvWorkspace& ws,
                                                hipStream_t stream)
     {
+        bool almost_invariant_seqlen = is_almost_invariant_seqlen_q(param);
+
         const auto kargs = [&] {
             return HstuKernel::MakeKargs(ws.o_acc_ptr,
                                          ws.lse_acc_ptr,
@@ -332,11 +337,13 @@ struct jagged_forward_splitkv_causal_softmax_bias_dropout_dispatch
                                          param.seq_q_offsets_ptr,
                                          param.num_head,
                                          ws.num_splits,
-                                         param.hdim_v);
+                                         param.hdim_v,
+                                         almost_invariant_seqlen);
         }();
 
-        dim3 kGridSize  = HstuKernel::GridSize(param.num_batch, param.num_head, param.max_seqlen_q);
-        dim3 kBlockSize = HstuKernel::BlockSize();
+        dim3 kGridSize = HstuKernel::GridSize(
+            param.num_batch, param.num_head, param.max_seqlen_q, almost_invariant_seqlen);
+        dim3 kBlockSize                        = HstuKernel::BlockSize();
         constexpr ck_tile::index_t kBlockPerCu = HstuKernel::kBlockPerCu;
 
         (void)ck_tile::launch_kernel(
