@@ -355,6 +355,7 @@ template <typename InOutDataType,
           bool kUseSoftmax,
           bool kHasBias,
           bool kIsDeterministic,
+          bool kHasDropout,
           ck_tile::index_t MaxK>
 struct batched_backward_single_dispatch
 {
@@ -442,7 +443,13 @@ struct batched_backward_single_dispatch
                                                   false, // kHasBiasGrad
                                                   occupancy>;
 
-        using Dropout = ck_tile::BlockDropoutBwd<false, true, false>; // no-dropout
+        // kHasDropout -> the M-major backward variant (single's Gemm0 P tile is
+        // M-major, same as base kernel_2); IsWG32 is a don't-care, derived
+        // internally from the BlockGemm passed at the Run/MakeRandvalDramWindow
+        // call site (see hstu_attention_with_softmax_bwd_pipeline_dk_dv.hpp:100-105).
+        using Dropout = std::conditional_t<kHasDropout,
+                                           ck_tile::BlockDropoutBwd<true, true, false>,
+                                           ck_tile::BlockDropoutBwd<false, true, false>>;
 
         using Problem = ck_tile::BlockFmhaBwdPipelineProblem<
             typename TC::ODataType,       // QDataType (== InOutDataType)
@@ -532,7 +539,11 @@ struct batched_backward_single_dispatch
                                        param.batch_stride_dk,
                                        param.batch_stride_dv,
                                        param.batch_stride_dq_acc,
-                                       param.split_stride_dq_acc);
+                                       param.split_stride_dq_acc,
+                                       param.num_head,
+                                       param.p_drop,
+                                       param.philox_seed,
+                                       param.philox_offset);
 
         launch_main_and_post<Pipeline, Kernel>(param, stream, kargs);
     }
@@ -548,7 +559,13 @@ struct batched_backward_single_dispatch
                                                   ck_tile::BlockAttentionBiasEnum::NO_BIAS,
                                                   false,
                                                   occupancy>;
-        using Dropout = ck_tile::BlockDropoutBwd<false, true, false>;
+        // kHasDropout -> the M-major backward variant (single's Gemm0 P tile is
+        // M-major, same as base kernel_2); IsWG32 is a don't-care, derived
+        // internally from the BlockGemm passed at the Run/MakeRandvalDramWindow
+        // call site (see hstu_attention_with_softmax_bwd_pipeline_dk_dv.hpp:100-105).
+        using Dropout = std::conditional_t<kHasDropout,
+                                           ck_tile::BlockDropoutBwd<true, true, false>,
+                                           ck_tile::BlockDropoutBwd<false, true, false>>;
 
         using Problem = ck_tile::BlockFmhaBwdPipelineProblem<
             typename TC::ODataType,
@@ -689,7 +706,11 @@ struct batched_backward_single_dispatch
                                        param.batch_stride_dq_acc,
                                        param.batch_stride_lse,
                                        batch_stride_delta,
-                                       param.split_stride_dq_acc);
+                                       param.split_stride_dq_acc,
+                                       param.num_head,
+                                       param.p_drop,
+                                       param.philox_seed,
+                                       param.philox_offset);
 
         launch_main_and_post<Pipeline, Kernel>(param, stream, kargs);
 
@@ -728,6 +749,7 @@ template <typename InOutDataType,
           bool kUseSoftmax,
           bool kHasBias,
           bool kIsDeterministic,
+          bool kHasDropout,
           ck_tile::index_t MaxK>
 void run_batched_backward_single_dispatch(HstuAttentionNoGroupBwdParams& param, hipStream_t stream)
 {
@@ -736,6 +758,7 @@ void run_batched_backward_single_dispatch(HstuAttentionNoGroupBwdParams& param, 
                                      kUseSoftmax,
                                      kHasBias,
                                      kIsDeterministic,
+                                     kHasDropout,
                                      MaxK>::Run(param, stream);
 }
 #endif // HSTU_BWD_SINGLE_KERNEL

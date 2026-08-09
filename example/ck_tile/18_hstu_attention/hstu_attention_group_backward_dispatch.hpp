@@ -341,6 +341,7 @@ template <typename InOutDataType,
           bool kUseSoftmax,
           bool kHasBias,
           bool kIsDeterministic,
+          bool kHasDropout,
           ck_tile::index_t MaxK>
 struct group_backward_single_dispatch
 {
@@ -650,6 +651,7 @@ template <typename InOutDataType,
           bool kUseSoftmax,
           bool kHasBias,
           bool kIsDeterministic,
+          bool kHasDropout,
           ck_tile::index_t MaxK>
 void run_group_backward_single_dispatch(HstuAttentionGroupBwdParams& param, hipStream_t stream)
 {
@@ -658,6 +660,7 @@ void run_group_backward_single_dispatch(HstuAttentionGroupBwdParams& param, hipS
                                    kUseSoftmax,
                                    kHasBias,
                                    kIsDeterministic,
+                                   kHasDropout,
                                    MaxK>::Run(param, stream);
 }
 #endif // HSTU_BWD_SINGLE_KERNEL

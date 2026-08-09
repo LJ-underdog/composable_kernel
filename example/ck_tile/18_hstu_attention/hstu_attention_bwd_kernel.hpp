@@ -5,6 +5,7 @@
 
 #include <hip/hip_runtime.h>
 #include "ck_tile/core.hpp"
+#include <ck_tile/ops/fmha/block/block_dropout.hpp>
 #if defined(HSTU_BWD_SINGLE_KERNEL)
 // Guarded: this header is only ever reached from the single-kernel `#if` blocks
 // of the two bwd dispatch headers. Keeping the guard here prevents the single
@@ -67,6 +68,7 @@ struct HstuAttentionBwdDQDKDVKernel
     static constexpr index_t kPadHeadDimQ  = HstuPipeline::kPadHeadDimQ;
     static constexpr index_t kPadHeadDimV  = HstuPipeline::kPadHeadDimV;
     static constexpr bool kIsDeterministic = HstuPipeline::kIsDeterministic;
+    static constexpr bool kHasDropout       = HstuPipeline::kHasDropout;
 
     struct Kargs
     {
@@ -125,6 +127,28 @@ struct HstuAttentionBwdDQDKDVKernel
         index_t batch_stride_dv;
         index_t batch_stride_dq_acc;
         index_t split_stride_dq_acc; // M6 deterministic: per-split slot stride (single-slot elems)
+        // ---- dropout (kHasDropout only; inert otherwise) ----
+        // Mirrors base HstuBwdKernel2CommonDropoutKargs
+        // (hstu_attention_bwd_kernel_2.hpp:259-278). Flat members because single's
+        // Kargs is a flat aggregate (base uses conditional_t inheritance).
+        void init_dropout(float p_drop, uint64_t seed, uint64_t offset)
+        {
+            float p_undrop = 1.0 - p_drop;
+            p_undrop_in_uint8_t =
+                uint8_t(std::floor(p_undrop * std::numeric_limits<uint8_t>::max()));
+            rp_undrop = 1.0 / p_undrop;
+
+            this->drop_seed   = seed;
+            this->drop_offset = offset;
+        }
+
+        // head count: BlockDropoutBwd 的 ph_head_offset 需要 nheads
+        // (offset + (i_batch*nheads + i_head)*philox_per_tile)，必须与 fwd 一致。
+        index_t num_head            = 1;
+        uint64_t drop_seed          = 0;
+        uint64_t drop_offset        = 0;
+        float rp_undrop             = 1;
+        uint8_t p_undrop_in_uint8_t = std::numeric_limits<uint8_t>::max();
     };
 
     CK_TILE_HOST static constexpr Kargs MakeKargs(const void* q_ptr,
@@ -169,7 +193,11 @@ struct HstuAttentionBwdDQDKDVKernel
                                                   index_t batch_stride_dk,
                                                   index_t batch_stride_dv,
                                                   index_t batch_stride_dq_acc,
-                                                  index_t split_stride_dq_acc)
+                                                  index_t split_stride_dq_acc,
+                                                  index_t num_head,
+                                                  float p_drop,
+                                                  uint64_t philox_seed,
+                                                  uint64_t philox_offset)
     {
         Kargs k;
         k.q_ptr               = q_ptr;
@@ -215,6 +243,11 @@ struct HstuAttentionBwdDQDKDVKernel
         k.batch_stride_dv     = batch_stride_dv;
         k.batch_stride_dq_acc = batch_stride_dq_acc;
         k.split_stride_dq_acc = split_stride_dq_acc;
+        if constexpr(kHasDropout)
+        {
+            k.num_head = num_head;
+            k.init_dropout(p_drop, philox_seed, philox_offset);
+        }
         return k;
     }
 
@@ -453,6 +486,56 @@ struct HstuAttentionBwdDQDKDVKernel
             }
         }();
 
+        // ---- dropout: null randval window + M-major bwd dropout object ----
+        // Copied from base hstu_attention_bwd_kernel_2.hpp:970-1018. randval is not
+        // stored (a separate kernel generates it for the host), but BlockDropoutBwd::Run
+        // still needs a dram window to carry start_m0_idx.
+        auto null_randval_window = [&]() {
+            if constexpr(kHasDropout)
+            {
+                const auto null_randval_dram = [&]() {
+                    const auto null_dram_naive = make_naive_tensor_view<address_space_enum::global>(
+                        static_cast<uint8_t*>(nullptr),
+                        make_tuple(kargs.seqlen_q, kargs.seqlen_kv),
+                        make_tuple(kargs.seqlen_kv, 1),
+                        number<1>{},
+                        number<1>{});
+
+                    return pad_tensor_view(null_dram_naive,
+                                           make_tuple(number<HstuPipeline::kM0>{},
+                                                      number<HstuPipeline::kN0>{}),
+                                           sequence<true, true>{});
+                }();
+
+                return make_tile_window(null_randval_dram,
+                                        make_tuple(number<HstuPipeline::kM0>{},
+                                                   number<HstuPipeline::kN0>{}),
+                                        {0, i_n0});
+            }
+            else
+                return make_null_tile_window(make_tuple(number<1>{}, number<1>{}));
+        }();
+
+        auto dropout = [&, i_nhead_ = i_nhead, i_batch_ = i_batch]() {
+            if constexpr(kHasDropout)
+            {
+                // Same (i_batch, i_head, nheads, seed, offset) as fwd/base => identical
+                // ph_head_offset = offset + (i_batch*nheads + i_head)*philox_per_tile
+                // (block_dropout.hpp:99-100 vs :456-457), so the mask matches byte-for-byte.
+                return typename HstuPipeline::DropoutType{i_batch_,
+                                                          i_nhead_,
+                                                          kargs.num_head,
+                                                          kargs.drop_seed,
+                                                          kargs.drop_offset,
+                                                          kargs.rp_undrop,
+                                                          kargs.p_undrop_in_uint8_t};
+            }
+            else
+            {
+                return typename HstuPipeline::DropoutType{};
+            }
+        }();
+
         auto [dk_acc_tile, dv_acc_tile] = HstuPipeline{}(q_dram_window,
                                                          k_dram_window,
                                                          v_dram_window,
@@ -461,7 +544,9 @@ struct HstuAttentionBwdDQDKDVKernel
                                                          mask,
                                                          kargs.alpha,
                                                          kargs.scale_p,
-                                                         smem_ptr);
+                                                         smem_ptr,
+                                                         null_randval_window,
+                                                         dropout);
 
         auto dk_dram = pad_tensor_view(
             make_naive_tensor_view<address_space_enum::global>(
@@ -525,6 +610,7 @@ struct HstuAttentionBwdDQDKDVSoftmaxKernel
     static constexpr index_t kPadHeadDimQ  = HstuPipeline::kPadHeadDimQ;
     static constexpr index_t kPadHeadDimV  = HstuPipeline::kPadHeadDimV;
     static constexpr bool kIsDeterministic = HstuPipeline::kIsDeterministic;
+    static constexpr bool kHasDropout       = HstuPipeline::kHasDropout;
 
     struct Kargs
     {
@@ -587,6 +673,28 @@ struct HstuAttentionBwdDQDKDVSoftmaxKernel
         index_t batch_stride_lse;
         index_t batch_stride_delta;
         index_t split_stride_dq_acc; // M6 deterministic
+        // ---- dropout (kHasDropout only; inert otherwise) ----
+        // Mirrors base HstuBwdKernel2CommonDropoutKargs
+        // (hstu_attention_bwd_kernel_2.hpp:259-278). Flat members because single's
+        // Kargs is a flat aggregate (base uses conditional_t inheritance).
+        void init_dropout(float p_drop, uint64_t seed, uint64_t offset)
+        {
+            float p_undrop = 1.0 - p_drop;
+            p_undrop_in_uint8_t =
+                uint8_t(std::floor(p_undrop * std::numeric_limits<uint8_t>::max()));
+            rp_undrop = 1.0 / p_undrop;
+
+            this->drop_seed   = seed;
+            this->drop_offset = offset;
+        }
+
+        // head count: BlockDropoutBwd 的 ph_head_offset 需要 nheads
+        // (offset + (i_batch*nheads + i_head)*philox_per_tile)，必须与 fwd 一致。
+        index_t num_head            = 1;
+        uint64_t drop_seed          = 0;
+        uint64_t drop_offset        = 0;
+        float rp_undrop             = 1;
+        uint8_t p_undrop_in_uint8_t = std::numeric_limits<uint8_t>::max();
     };
 
     CK_TILE_HOST static constexpr Kargs MakeKargs(const void* q_ptr,
@@ -638,7 +746,11 @@ struct HstuAttentionBwdDQDKDVSoftmaxKernel
                                                   index_t batch_stride_dq_acc,
                                                   index_t batch_stride_lse,
                                                   index_t batch_stride_delta,
-                                                  index_t split_stride_dq_acc)
+                                                  index_t split_stride_dq_acc,
+                                                  index_t num_head,
+                                                  float p_drop,
+                                                  uint64_t philox_seed,
+                                                  uint64_t philox_offset)
     {
         Kargs k;
         k.q_ptr                = q_ptr;
@@ -691,6 +803,11 @@ struct HstuAttentionBwdDQDKDVSoftmaxKernel
         k.batch_stride_lse     = batch_stride_lse;
         k.batch_stride_delta   = batch_stride_delta;
         k.split_stride_dq_acc  = split_stride_dq_acc;
+        if constexpr(kHasDropout)
+        {
+            k.num_head = num_head;
+            k.init_dropout(p_drop, philox_seed, philox_offset);
+        }
         return k;
     }
 
@@ -911,6 +1028,56 @@ struct HstuAttentionBwdDQDKDVSoftmaxKernel
             }
         }();
 
+        // ---- dropout: null randval window + M-major bwd dropout object ----
+        // Copied from base hstu_attention_bwd_kernel_2.hpp:970-1018. randval is not
+        // stored (a separate kernel generates it for the host), but BlockDropoutBwd::Run
+        // still needs a dram window to carry start_m0_idx.
+        auto null_randval_window = [&]() {
+            if constexpr(kHasDropout)
+            {
+                const auto null_randval_dram = [&]() {
+                    const auto null_dram_naive = make_naive_tensor_view<address_space_enum::global>(
+                        static_cast<uint8_t*>(nullptr),
+                        make_tuple(kargs.seqlen_q, kargs.seqlen_kv),
+                        make_tuple(kargs.seqlen_kv, 1),
+                        number<1>{},
+                        number<1>{});
+
+                    return pad_tensor_view(null_dram_naive,
+                                           make_tuple(number<HstuPipeline::kM0>{},
+                                                      number<HstuPipeline::kN0>{}),
+                                           sequence<true, true>{});
+                }();
+
+                return make_tile_window(null_randval_dram,
+                                        make_tuple(number<HstuPipeline::kM0>{},
+                                                   number<HstuPipeline::kN0>{}),
+                                        {0, i_n0});
+            }
+            else
+                return make_null_tile_window(make_tuple(number<1>{}, number<1>{}));
+        }();
+
+        auto dropout = [&, i_nhead_ = i_nhead, i_batch_ = i_batch]() {
+            if constexpr(kHasDropout)
+            {
+                // Same (i_batch, i_head, nheads, seed, offset) as fwd/base => identical
+                // ph_head_offset = offset + (i_batch*nheads + i_head)*philox_per_tile
+                // (block_dropout.hpp:99-100 vs :456-457), so the mask matches byte-for-byte.
+                return typename HstuPipeline::DropoutType{i_batch_,
+                                                          i_nhead_,
+                                                          kargs.num_head,
+                                                          kargs.drop_seed,
+                                                          kargs.drop_offset,
+                                                          kargs.rp_undrop,
+                                                          kargs.p_undrop_in_uint8_t};
+            }
+            else
+            {
+                return typename HstuPipeline::DropoutType{};
+            }
+        }();
+
         auto [dk_acc_tile, dv_acc_tile] = HstuPipeline{}(q_dram_window,
                                                          k_dram_window,
                                                          v_dram_window,
@@ -920,7 +1087,9 @@ struct HstuAttentionBwdDQDKDVSoftmaxKernel
                                                          dq_dram_window,
                                                          mask,
                                                          kargs.alpha,
-                                                         smem_ptr);
+                                                         smem_ptr,
+                                                         null_randval_window,
+                                                         dropout);
 
         auto dk_dram = pad_tensor_view(
             make_naive_tensor_view<address_space_enum::global>(
@@ -1142,6 +1311,12 @@ struct HstuAttentionBwdDQDKDVGroupKernel
         __shared__ char smem_ptr[GetSmemSize()];
 
         const auto [i_tile_n, i_nhead, i_batch] = GetTileIndex();
+        // ---- dropout: group 路当前不支持 dropout（其门仍关闭），这里只是让
+        // pipeline 的新签名对得上。DropoutType 由 group dispatch 绑成
+        // BlockDropoutBwd<false,...> 的 null 特化，故整段在编译期消失。 ----
+        auto null_randval_window = make_null_tile_window(make_tuple(number<1>{}, number<1>{}));
+        auto dropout             = typename PipelineLocal::DropoutType{};
+
         const index_t i_n0 = __builtin_amdgcn_readfirstlane(i_tile_n * P::kN0);
 
         // jagged offsets (token-major packed; same as M3)
@@ -1307,7 +1482,8 @@ struct HstuAttentionBwdDQDKDVGroupKernel
             }();
             auto [dk_acc_tile, dv_acc_tile] =
                 PipelineLocal{}(q_dram_window, k_dram_window, v_dram_window, do_dram_window,
-                                dq_dram_window, mask, kargs.alpha, scale_p, smem_ptr);
+                                dq_dram_window, mask, kargs.alpha, scale_p, smem_ptr,
+                                null_randval_window, dropout);
             write_dkdv(dk_acc_tile, dv_acc_tile);
         }
         else
@@ -1322,7 +1498,8 @@ struct HstuAttentionBwdDQDKDVGroupKernel
             }();
             auto [dk_acc_tile, dv_acc_tile] =
                 PipelineNoLocal{}(q_dram_window, k_dram_window, v_dram_window, do_dram_window,
-                                  dq_dram_window, mask, kargs.alpha, scale_p, smem_ptr);
+                                  dq_dram_window, mask, kargs.alpha, scale_p, smem_ptr,
+                                  null_randval_window, dropout);
             write_dkdv(dk_acc_tile, dv_acc_tile);
         }
     }
@@ -1535,6 +1712,12 @@ struct HstuAttentionBwdDQDKDVGroupSoftmaxKernel
         __shared__ char smem_ptr[GetSmemSize()];
 
         const auto [i_tile_n, i_nhead, i_batch] = GetTileIndex();
+        // ---- dropout: group 路当前不支持 dropout（其门仍关闭），这里只是让
+        // pipeline 的新签名对得上。DropoutType 由 group dispatch 绑成
+        // BlockDropoutBwd<false,...> 的 null 特化，故整段在编译期消失。 ----
+        auto null_randval_window = make_null_tile_window(make_tuple(number<1>{}, number<1>{}));
+        auto dropout             = typename PipelineLocal::DropoutType{};
+
         const index_t i_n0 = __builtin_amdgcn_readfirstlane(i_tile_n * P::kN0);
 
         const auto* q_offsets  = reinterpret_cast<const int32_t*>(kargs.seq_q_offsets_ptr);
@@ -1708,7 +1891,7 @@ struct HstuAttentionBwdDQDKDVGroupSoftmaxKernel
             auto [dk_acc_tile, dv_acc_tile] =
                 PipelineLocal{}(q_dram_window, k_dram_window, v_dram_window, do_dram_window,
                                 lse_dram_window, d_dram_window, dq_dram_window, mask, kargs.alpha,
-                                smem_ptr);
+                                smem_ptr, null_randval_window, dropout);
             write_dkdv(dk_acc_tile, dv_acc_tile);
         }
         else
@@ -1724,7 +1907,7 @@ struct HstuAttentionBwdDQDKDVGroupSoftmaxKernel
             auto [dk_acc_tile, dv_acc_tile] =
                 PipelineNoLocal{}(q_dram_window, k_dram_window, v_dram_window, do_dram_window,
                                   lse_dram_window, d_dram_window, dq_dram_window, mask, kargs.alpha,
-                                  smem_ptr);
+                                  smem_ptr, null_randval_window, dropout);
             write_dkdv(dk_acc_tile, dv_acc_tile);
         }
     }

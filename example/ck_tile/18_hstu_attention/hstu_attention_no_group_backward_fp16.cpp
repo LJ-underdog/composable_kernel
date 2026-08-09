@@ -27,25 +27,21 @@ void hstu_attention_no_group_backward_fp16(HstuAttentionNoGroupBwdParams& param,
                   [&] {
                       HDIM_SWITCH(param.hdim_qk, param.hdim_v, MaxK, [&] {
 #if defined(HSTU_BWD_SINGLE_KERNEL)
-                          // single kernel 没有 dropout（jagged 已支持：其 Run 按
-                          // param.is_jagged 走 offsets 寻址，见
-                          // hstu_attention_batched_backward_dispatch.hpp 的 RunSoftmax）。
-                          // 故仅当 !has_dropout 时才走 single；否则落到下面 base 原路。
-                          if(!has_dropout)
-                          {
-                              // single 第 5 模板轴 = kIsDeterministic（与 base 第 5 轴
-                              // kHasDropout 语义不同），值取自 param.kIsDeterministic，
-                              // 经 BOOL_SWITCH 展开为编译期常量。
-                              BOOL_SWITCH(param.kIsDeterministic, kIsDeterministic, [&] {
-                                  run_batched_backward_single_dispatch<ck_tile::fp16_t,
-                                                                       kUseCausal,
-                                                                       kUseSoftmax,
-                                                                       kHasBias,
-                                                                       kIsDeterministic,
-                                                                       MaxK>(param, stream);
-                              });
-                              return;
-                          }
+                          // single kernel 现已支持 dropout（第 6 模板轴 kHasDropout，
+                          // pipeline 侧用 BlockDropoutBwd 的 M-major 变体重算 mask）
+                          // 与 jagged（运行期 param.is_jagged）⇒ no-group bwd 无条件走
+                          // single；下面的 base 原路只在 flag=OFF 时编译。
+                          // 第 5 轴 kIsDeterministic 是 OURS 专有轴（qf/base 没有）。
+                          BOOL_SWITCH(param.kIsDeterministic, kIsDeterministic, [&] {
+                              run_batched_backward_single_dispatch<ck_tile::fp16_t,
+                                                                   kUseCausal,
+                                                                   kUseSoftmax,
+                                                                   kHasBias,
+                                                                   kIsDeterministic,
+                                                                   kHasDropout,
+                                                                   MaxK>(param, stream);
+                          });
+                          return;
 #endif
                           if(param.is_jagged)
                               run_jagged_backward_dispatch<ck_tile::fp16_t,

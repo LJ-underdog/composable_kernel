@@ -41,6 +41,7 @@ void hstu_attention_group_backward_bf16(HstuAttentionGroupBwdParams& param, hipS
                                                                      kUseSoftmax,
                                                                      kHasBias,
                                                                      kIsDeterministic,
+                                                                     kHasDropout,
                                                                      MaxK>(param, stream);
                               });
                               return;

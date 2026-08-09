@@ -65,6 +65,14 @@ BOOL_MAP_BIAS = {
     False: "no_bias",
 }
 
+# OURS-only axis (single-kernel path). Lexically distinct from BOOL_MAP_DROPOUT
+# so the determinism axis and the real dropout axis can never be confused in a
+# file name -- they now coexist in the single-kernel instance names.
+BOOL_MAP_DETERM = {
+    True: "determ",
+    False: "atomic",
+}
+
 BOOL_MAP_DROPOUT = {
     True: "has_dropout",
     False: "no_dropout",
@@ -100,12 +108,14 @@ MODE_GROUP_OR_NOT_MAP = {
 #   * generated *file names* carry the infix `_backward_single_` so they match
 #     the CMake GLOB `instances_single/*_backward_single_*.cpp`;
 #   * mode axis is only ["batched", "group"] (jagged not included in v1).
-# The template parameter layout is identical to the base one (the interface TU
-# calls run_batched_backward_single_dispatch<DType, kUseCausal, kUseSoftmax,
-# kHasBias, kHasDropout, MaxK>), so the fifth axis position is preserved. Its
-# semantics differ in OURS (kIsDeterministic vs base kHasDropout) but the
-# codegen only needs to emit both true/false values in that position so the
-# explicit instantiations match every call the interface TU can make.
+# Template parameter layout (OURS, single-kernel path) is SIX axes:
+#   <DType, kUseCausal, kUseSoftmax, kHasBias, kIsDeterministic, kHasDropout, MaxK>
+# The 5th axis kIsDeterministic is OURS-only (qf/base has no determinism axis);
+# the 6th axis kHasDropout is the real dropout axis and matches base semantics.
+# Historically the 5th axis was emitted through a loop variable named
+# `has_dropout` and file names carried has_dropout/no_dropout while actually
+# encoding determinism. That misnaming is now fixed: the determinism axis uses
+# BOOL_MAP_DETERM (determ/atomic) and `has_dropout` means dropout again.
 # ---------------------------------------------------------------------------
 
 HSTU_BACKWARD_SINGLE_INSTANCE_TEMPLATE_INC = """
@@ -120,6 +130,7 @@ HSTU_BACKWARD_SINGLE_INSTANCE_TEMPLATE = """
     {has_causal},
     {use_softmax},
     {has_bias},
+    {is_deterministic},
     {has_dropout},
     {max_k}>(HstuAttention{group_or_not}BwdParams& param, hipStream_t stream);
 """
@@ -131,7 +142,8 @@ HSTU_BACKWARD_SINGLE_INSTANCE_TEMPLATE = """
 # files from the build.
 HSTU_BACKWARD_SINGLE_INSTANCE_FNAME = (
     "hstu_attention_{mode}_backward_single_{dtype_str}_{has_or_no_causal_str}_"
-    "{use_softmax_or_not_str}_{has_or_no_bias_str}_{has_or_no_dropout_str}_{max_k_str}.cpp"
+    "{use_softmax_or_not_str}_{has_or_no_bias_str}_{determ_or_atomic_str}_"
+    "{has_or_no_dropout_str}_{max_k_str}.cpp"
 )
 
 HSTU_BACKWARD_SINGLE_INSTANCE_REF_FNAME = (
@@ -147,7 +159,10 @@ def create_backward_single_instances(instance_dir: Path, headdims: List) -> None
             for has_causal in [True, False]:
                 for use_softmax in [True, False]:
                     for has_bias in [False]:
-                        for has_dropout in [True, False]:
+                        # 5th axis: OURS-only determinism (was misnamed has_dropout)
+                        for is_deterministic in [True, False]:
+                          # 6th axis: the real dropout axis
+                          for has_dropout in [True, False]:
                             for max_k in headdims:
                                 fname = HSTU_BACKWARD_SINGLE_INSTANCE_FNAME.format(
                                     mode=mode,
@@ -157,6 +172,9 @@ def create_backward_single_instances(instance_dir: Path, headdims: List) -> None
                                         use_softmax
                                     ],
                                     has_or_no_bias_str=BOOL_MAP_BIAS[has_bias],
+                                    determ_or_atomic_str=BOOL_MAP_DETERM[
+                                        is_deterministic
+                                    ],
                                     has_or_no_dropout_str=BOOL_MAP_DROPOUT[has_dropout],
                                     max_k_str=INT_MAP_MAX_K[max_k],
                                 )
@@ -174,6 +192,7 @@ def create_backward_single_instances(instance_dir: Path, headdims: List) -> None
                                         has_causal=BOOL_MAP[has_causal],
                                         use_softmax=BOOL_MAP[use_softmax],
                                         has_bias=BOOL_MAP[has_bias],
+                                        is_deterministic=BOOL_MAP[is_deterministic],
                                         has_dropout=BOOL_MAP[has_dropout],
                                         max_k=max_k,
                                         group_or_not=MODE_GROUP_OR_NOT_MAP[mode],
@@ -203,7 +222,8 @@ def create_backward_single_instances_ref(instance_dir: Path, headdims: List) -> 
                 file.write(backward_instance_inc)
                 for max_k in headdims:
                     for has_bias in [False]:
-                        for has_dropout in [True, False]:
+                        for is_deterministic in [True, False]:
+                          for has_dropout in [True, False]:
                             for has_causal in [True, False]:
                                 for use_softmax in [True, False]:
                                     backward_instance = (
@@ -214,6 +234,7 @@ def create_backward_single_instances_ref(instance_dir: Path, headdims: List) -> 
                                             has_causal=BOOL_MAP[has_causal],
                                             use_softmax=BOOL_MAP[use_softmax],
                                             has_bias=BOOL_MAP[has_bias],
+                                            is_deterministic=BOOL_MAP[is_deterministic],
                                             has_dropout=BOOL_MAP[has_dropout],
                                             max_k=max_k,
                                             group_or_not=MODE_GROUP_OR_NOT_MAP[mode],

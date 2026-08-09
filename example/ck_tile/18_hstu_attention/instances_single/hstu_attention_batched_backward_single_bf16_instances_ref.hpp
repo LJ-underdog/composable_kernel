@@ -16,6 +16,43 @@ extern template void run_batched_backward_single_dispatch<
     true,
     false,
     true,
+    true,
+    64>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_single_dispatch<
+    ck_tile::bf16_t,
+    true,
+    false,
+    false,
+    true,
+    true,
+    64>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_single_dispatch<
+    ck_tile::bf16_t,
+    false,
+    true,
+    false,
+    true,
+    true,
+    64>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_single_dispatch<
+    ck_tile::bf16_t,
+    false,
+    false,
+    false,
+    true,
+    true,
+    64>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_single_dispatch<
+    ck_tile::bf16_t,
+    true,
+    true,
+    false,
+    true,
+    false,
     64>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
 
 extern template void run_batched_backward_single_dispatch<
@@ -24,37 +61,6 @@ extern template void run_batched_backward_single_dispatch<
     false,
     false,
     true,
-    64>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
-
-extern template void run_batched_backward_single_dispatch<
-    ck_tile::bf16_t,
-    false,
-    true,
-    false,
-    true,
-    64>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
-
-extern template void run_batched_backward_single_dispatch<
-    ck_tile::bf16_t,
-    false,
-    false,
-    false,
-    true,
-    64>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
-
-extern template void run_batched_backward_single_dispatch<
-    ck_tile::bf16_t,
-    true,
-    true,
-    false,
-    false,
-    64>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
-
-extern template void run_batched_backward_single_dispatch<
-    ck_tile::bf16_t,
-    true,
-    false,
-    false,
     false,
     64>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
 
@@ -63,11 +69,85 @@ extern template void run_batched_backward_single_dispatch<
     false,
     true,
     false,
+    true,
     false,
     64>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
 
 extern template void run_batched_backward_single_dispatch<
     ck_tile::bf16_t,
+    false,
+    false,
+    false,
+    true,
+    false,
+    64>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_single_dispatch<
+    ck_tile::bf16_t,
+    true,
+    true,
+    false,
+    false,
+    true,
+    64>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_single_dispatch<
+    ck_tile::bf16_t,
+    true,
+    false,
+    false,
+    false,
+    true,
+    64>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_single_dispatch<
+    ck_tile::bf16_t,
+    false,
+    true,
+    false,
+    false,
+    true,
+    64>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_single_dispatch<
+    ck_tile::bf16_t,
+    false,
+    false,
+    false,
+    false,
+    true,
+    64>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_single_dispatch<
+    ck_tile::bf16_t,
+    true,
+    true,
+    false,
+    false,
+    false,
+    64>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_single_dispatch<
+    ck_tile::bf16_t,
+    true,
+    false,
+    false,
+    false,
+    false,
+    64>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_single_dispatch<
+    ck_tile::bf16_t,
+    false,
+    true,
+    false,
+    false,
+    false,
+    64>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_single_dispatch<
+    ck_tile::bf16_t,
+    false,
     false,
     false,
     false,
@@ -79,6 +159,7 @@ extern template void run_batched_backward_single_dispatch<
     true,
     true,
     false,
+    true,
     true,
     96>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
 
@@ -88,46 +169,16 @@ extern template void run_batched_backward_single_dispatch<
     false,
     false,
     true,
-    96>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
-
-extern template void run_batched_backward_single_dispatch<
-    ck_tile::bf16_t,
-    false,
-    true,
-    false,
     true,
     96>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
 
 extern template void run_batched_backward_single_dispatch<
     ck_tile::bf16_t,
     false,
-    false,
-    false,
-    true,
-    96>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
-
-extern template void run_batched_backward_single_dispatch<
-    ck_tile::bf16_t,
-    true,
     true,
     false,
-    false,
-    96>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
-
-extern template void run_batched_backward_single_dispatch<
-    ck_tile::bf16_t,
     true,
-    false,
-    false,
-    false,
-    96>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
-
-extern template void run_batched_backward_single_dispatch<
-    ck_tile::bf16_t,
-    false,
     true,
-    false,
-    false,
     96>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
 
 extern template void run_batched_backward_single_dispatch<
@@ -135,7 +186,8 @@ extern template void run_batched_backward_single_dispatch<
     false,
     false,
     false,
-    false,
+    true,
+    true,
     96>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
 
 extern template void run_batched_backward_single_dispatch<
@@ -144,6 +196,115 @@ extern template void run_batched_backward_single_dispatch<
     true,
     false,
     true,
+    false,
+    96>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_single_dispatch<
+    ck_tile::bf16_t,
+    true,
+    false,
+    false,
+    true,
+    false,
+    96>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_single_dispatch<
+    ck_tile::bf16_t,
+    false,
+    true,
+    false,
+    true,
+    false,
+    96>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_single_dispatch<
+    ck_tile::bf16_t,
+    false,
+    false,
+    false,
+    true,
+    false,
+    96>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_single_dispatch<
+    ck_tile::bf16_t,
+    true,
+    true,
+    false,
+    false,
+    true,
+    96>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_single_dispatch<
+    ck_tile::bf16_t,
+    true,
+    false,
+    false,
+    false,
+    true,
+    96>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_single_dispatch<
+    ck_tile::bf16_t,
+    false,
+    true,
+    false,
+    false,
+    true,
+    96>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_single_dispatch<
+    ck_tile::bf16_t,
+    false,
+    false,
+    false,
+    false,
+    true,
+    96>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_single_dispatch<
+    ck_tile::bf16_t,
+    true,
+    true,
+    false,
+    false,
+    false,
+    96>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_single_dispatch<
+    ck_tile::bf16_t,
+    true,
+    false,
+    false,
+    false,
+    false,
+    96>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_single_dispatch<
+    ck_tile::bf16_t,
+    false,
+    true,
+    false,
+    false,
+    false,
+    96>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_single_dispatch<
+    ck_tile::bf16_t,
+    false,
+    false,
+    false,
+    false,
+    false,
+    96>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_single_dispatch<
+    ck_tile::bf16_t,
+    true,
+    true,
+    false,
+    true,
+    true,
     128>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
 
 extern template void run_batched_backward_single_dispatch<
@@ -152,6 +313,43 @@ extern template void run_batched_backward_single_dispatch<
     false,
     false,
     true,
+    true,
+    128>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_single_dispatch<
+    ck_tile::bf16_t,
+    false,
+    true,
+    false,
+    true,
+    true,
+    128>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_single_dispatch<
+    ck_tile::bf16_t,
+    false,
+    false,
+    false,
+    true,
+    true,
+    128>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_single_dispatch<
+    ck_tile::bf16_t,
+    true,
+    true,
+    false,
+    true,
+    false,
+    128>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_single_dispatch<
+    ck_tile::bf16_t,
+    true,
+    false,
+    false,
+    true,
+    false,
     128>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
 
 extern template void run_batched_backward_single_dispatch<
@@ -160,37 +358,6 @@ extern template void run_batched_backward_single_dispatch<
     true,
     false,
     true,
-    128>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
-
-extern template void run_batched_backward_single_dispatch<
-    ck_tile::bf16_t,
-    false,
-    false,
-    false,
-    true,
-    128>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
-
-extern template void run_batched_backward_single_dispatch<
-    ck_tile::bf16_t,
-    true,
-    true,
-    false,
-    false,
-    128>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
-
-extern template void run_batched_backward_single_dispatch<
-    ck_tile::bf16_t,
-    true,
-    false,
-    false,
-    false,
-    128>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
-
-extern template void run_batched_backward_single_dispatch<
-    ck_tile::bf16_t,
-    false,
-    true,
-    false,
     false,
     128>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
 
@@ -199,6 +366,7 @@ extern template void run_batched_backward_single_dispatch<
     false,
     false,
     false,
+    true,
     false,
     128>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
 
@@ -207,6 +375,79 @@ extern template void run_batched_backward_single_dispatch<
     true,
     true,
     false,
+    false,
+    true,
+    128>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_single_dispatch<
+    ck_tile::bf16_t,
+    true,
+    false,
+    false,
+    false,
+    true,
+    128>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_single_dispatch<
+    ck_tile::bf16_t,
+    false,
+    true,
+    false,
+    false,
+    true,
+    128>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_single_dispatch<
+    ck_tile::bf16_t,
+    false,
+    false,
+    false,
+    false,
+    true,
+    128>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_single_dispatch<
+    ck_tile::bf16_t,
+    true,
+    true,
+    false,
+    false,
+    false,
+    128>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_single_dispatch<
+    ck_tile::bf16_t,
+    true,
+    false,
+    false,
+    false,
+    false,
+    128>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_single_dispatch<
+    ck_tile::bf16_t,
+    false,
+    true,
+    false,
+    false,
+    false,
+    128>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_single_dispatch<
+    ck_tile::bf16_t,
+    false,
+    false,
+    false,
+    false,
+    false,
+    128>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_single_dispatch<
+    ck_tile::bf16_t,
+    true,
+    true,
+    false,
+    true,
     true,
     256>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
 
@@ -216,6 +457,43 @@ extern template void run_batched_backward_single_dispatch<
     false,
     false,
     true,
+    true,
+    256>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_single_dispatch<
+    ck_tile::bf16_t,
+    false,
+    true,
+    false,
+    true,
+    true,
+    256>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_single_dispatch<
+    ck_tile::bf16_t,
+    false,
+    false,
+    false,
+    true,
+    true,
+    256>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_single_dispatch<
+    ck_tile::bf16_t,
+    true,
+    true,
+    false,
+    true,
+    false,
+    256>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_single_dispatch<
+    ck_tile::bf16_t,
+    true,
+    false,
+    false,
+    true,
+    false,
     256>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
 
 extern template void run_batched_backward_single_dispatch<
@@ -224,10 +502,48 @@ extern template void run_batched_backward_single_dispatch<
     true,
     false,
     true,
+    false,
     256>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
 
 extern template void run_batched_backward_single_dispatch<
     ck_tile::bf16_t,
+    false,
+    false,
+    false,
+    true,
+    false,
+    256>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_single_dispatch<
+    ck_tile::bf16_t,
+    true,
+    true,
+    false,
+    false,
+    true,
+    256>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_single_dispatch<
+    ck_tile::bf16_t,
+    true,
+    false,
+    false,
+    false,
+    true,
+    256>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_single_dispatch<
+    ck_tile::bf16_t,
+    false,
+    true,
+    false,
+    false,
+    true,
+    256>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_single_dispatch<
+    ck_tile::bf16_t,
+    false,
     false,
     false,
     false,
@@ -240,10 +556,21 @@ extern template void run_batched_backward_single_dispatch<
     true,
     false,
     false,
+    false,
     256>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
 
 extern template void run_batched_backward_single_dispatch<
     ck_tile::bf16_t,
+    true,
+    false,
+    false,
+    false,
+    false,
+    256>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
+
+extern template void run_batched_backward_single_dispatch<
+    ck_tile::bf16_t,
+    false,
     true,
     false,
     false,
@@ -253,13 +580,6 @@ extern template void run_batched_backward_single_dispatch<
 extern template void run_batched_backward_single_dispatch<
     ck_tile::bf16_t,
     false,
-    true,
-    false,
-    false,
-    256>(HstuAttentionNoGroupBwdParams& param, hipStream_t stream);
-
-extern template void run_batched_backward_single_dispatch<
-    ck_tile::bf16_t,
     false,
     false,
     false,

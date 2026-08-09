@@ -69,6 +69,11 @@ struct HstuAttentionWithSoftmaxBwdDQDKDVPipelineKRKTRVR
     static constexpr index_t kPadHeadDimV  = Problem::kPadHeadDimV;
     static constexpr auto BiasEnum         = Problem::BiasEnum;
     static constexpr bool kIsDeterministic = Problem::kIsDeterministic;
+    // Dropout type comes from the Problem (BlockFmhaBwdPipelineProblem::FmhaDropout),
+    // which the dispatch binds to BlockDropoutBwd<true,...> or the <false,...> null
+    // specialisation. M-major variant: single is KV-outer/Q-inner like base kernel_2.
+    using DropoutType = typename Problem::FmhaDropout;
+    static constexpr bool kHasDropout = DropoutType::IsDropout;
     static constexpr bool kUseTrLoad       = Problem::kUseTrLoad;
     static_assert(!kUseTrLoad, "HSTU softmax bwd M5 uses the non-trload kr_ktr_vr path");
 
@@ -99,7 +104,8 @@ struct HstuAttentionWithSoftmaxBwdDQDKDVPipelineKRKTRVR
               typename OGradDramBlockWindowTmp,
               typename LSEDramBlockWindowTmp,
               typename DDramBlockWindowTmp,
-              typename QGradDramBlockWindowTmp>
+              typename QGradDramBlockWindowTmp,
+              typename NullRandValDramWindowTmp>
     CK_TILE_HOST_DEVICE auto operator()(const QDramBlockWindowTmp& q_dram_block_window_tmp,
                                         const KDramBlockWindowTmp& k_dram_block_window_tmp,
                                         const VDramBlockWindowTmp& v_dram_block_window_tmp,
@@ -109,7 +115,9 @@ struct HstuAttentionWithSoftmaxBwdDQDKDVPipelineKRKTRVR
                                         const QGradDramBlockWindowTmp& dq_dram_block_window_tmp,
                                         FmhaMask mask,
                                         float alpha,
-                                        void* smem_ptr) const
+                                        void* smem_ptr,
+                                        const NullRandValDramWindowTmp& null_randval_window_tmp,
+                                        DropoutType& dropout) const
     {
         // Block GEMM (identical to FMHA)
         constexpr auto gemm_0 = Policy::template GetQKBlockGemm<Problem>();
@@ -396,6 +404,9 @@ struct HstuAttentionWithSoftmaxBwdDQDKDVPipelineKRKTRVR
         using QGradBlockTileType  = decltype(gemm_4.MakeCBlockTile());
 
         index_t i_total_loops = 0;
+        auto null_randval_window = dropout.template MakeRandvalDramWindow<decltype(gemm_0)>(
+            null_randval_window_tmp, k_origin.at(number<0>{}));
+
         index_t seqlen_q_step = seqlen_q_start;
         static_assert(kQKHeaddim >= kK0, "kQKHeaddim should be equal or greater than kK0");
         static_assert(kM0 == kK1, "kM0 should equal to kK1");
@@ -468,7 +479,44 @@ struct HstuAttentionWithSoftmaxBwdDQDKDVPipelineKRKTRVR
                 });
             });
 
-            const auto p_gemm = cast_tile<GemmDataType>(p);
+            // ---- dropout：硬点 3 方案 (a) ----
+            // single 的 STAGE 3(dV)早于 STAGE 4/5(dP/dS)，不能照抄 base
+            // 「先 dP 再 dropout 再 dV」的顺序。故把 mask 生成提到这里（STAGE 2 之后、
+            // STAGE 3 之前），并同时保留纯 P 与 P_drop：
+            //   dV  用 P_drop = drop_scale * P
+            //   dS  用纯 P 作外层因子： dS = P * (drop_scale*dP - D)   ← D 不乘 drop_scale
+            // 与 base 的 with_softmax dk_dv:636-668 数学一致。
+            auto drop_mask =
+                make_static_distributed_tensor<int8_t>(p.get_tile_distribution());
+            if constexpr(kHasDropout)
+            {
+                // +1 哨兵 tile：Run 只翻符号（+1 保留 / -1 丢弃），1 byte/elem 省 VGPR。
+                tile_elementwise_inout([](auto& x) { x = type_convert<int8_t>(1); }, drop_mask);
+                dropout.template Run<decltype(gemm_0), uint8_t>(
+                    seqlen_q_step, k_origin.at(number<0>{}), drop_mask, null_randval_window);
+                move_tile_window(null_randval_window, {kM0, 0});
+            }
+
+            const auto p_gemm = [&]() {
+                if constexpr(kHasDropout)
+                {
+                    auto p_drop             = p;
+                    constexpr auto pd_spans = decltype(p_drop)::get_distributed_spans();
+                    sweep_tile_span(pd_spans[number<0>{}], [&](auto idx0) {
+                        sweep_tile_span(pd_spans[number<1>{}], [&](auto idx1) {
+                            constexpr auto ij = make_tuple(idx0, idx1);
+                            p_drop(ij)        = drop_mask[ij] > 0
+                                                    ? p[ij] * dropout.rp_undrop
+                                                    : type_convert<AccDataType>(0.0f);
+                        });
+                    });
+                    return cast_tile<GemmDataType>(p_drop);
+                }
+                else
+                {
+                    return cast_tile<GemmDataType>(p);
+                }
+            }();
 
             // STAGE 3, P^T @ dO^T  Gemm1 -> dV  (also stage D HBM->LDS here, like FMHA)
             auto do_block_tile = load_tile(do_dram_window);
@@ -509,7 +557,14 @@ struct HstuAttentionWithSoftmaxBwdDQDKDVPipelineKRKTRVR
                 constexpr auto i_idx = make_tuple(idx0);
                 sweep_tile_span(ds_spans[number<1>{}], [&](auto idx1) {
                     constexpr auto i_j_idx = make_tuple(idx0, idx1);
-                    ds(i_j_idx)            = p[i_j_idx] * (dp_acc[i_j_idx] - d[i_idx]);
+                    auto dp                = dp_acc[i_j_idx];
+                    if constexpr(kHasDropout)
+                    {
+                        // 只有 dP 乘 drop_scale；D 项不乘（base dk_dv:638-641）。
+                        dp = drop_mask[i_j_idx] > 0 ? dp * dropout.rp_undrop
+                                                    : type_convert<AccDataType>(0.0f);
+                    }
+                    ds(i_j_idx)            = p[i_j_idx] * (dp - d[i_idx]);
                 });
             });
 

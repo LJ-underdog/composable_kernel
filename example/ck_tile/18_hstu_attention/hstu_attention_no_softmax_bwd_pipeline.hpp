@@ -76,6 +76,8 @@ struct HstuAttentionBwdDQDKDVPipelineKRKTRVR
     static constexpr index_t kPadHeadDimV  = Problem::kPadHeadDimV;
     static constexpr auto BiasEnum         = Problem::BiasEnum;
     static constexpr bool kIsDeterministic = Problem::kIsDeterministic;
+    using DropoutType = typename Problem::FmhaDropout;
+    static constexpr bool kHasDropout = DropoutType::IsDropout;
     static constexpr bool kUseTrLoad       = Problem::kUseTrLoad;
     static_assert(!kUseTrLoad, "HSTU SiLU bwd M1 uses the non-trload kr_ktr_vr path");
 
@@ -104,7 +106,8 @@ struct HstuAttentionBwdDQDKDVPipelineKRKTRVR
               typename KDramBlockWindowTmp,
               typename VDramBlockWindowTmp,
               typename OGradDramBlockWindowTmp,
-              typename QGradDramBlockWindowTmp>
+              typename QGradDramBlockWindowTmp,
+              typename NullRandValDramWindowTmp>
     CK_TILE_HOST_DEVICE auto operator()(const QDramBlockWindowTmp& q_dram_block_window_tmp,
                                         const KDramBlockWindowTmp& k_dram_block_window_tmp,
                                         const VDramBlockWindowTmp& v_dram_block_window_tmp,
@@ -113,7 +116,9 @@ struct HstuAttentionBwdDQDKDVPipelineKRKTRVR
                                         FmhaMask mask,
                                         float alpha,
                                         float scale_p,
-                                        void* smem_ptr) const
+                                        void* smem_ptr,
+                                        const NullRandValDramWindowTmp& null_randval_window_tmp,
+                                        DropoutType& dropout) const
     {
         // Block GEMM (identical to FMHA)
         constexpr auto gemm_0 = Policy::template GetQKBlockGemm<Problem>();
@@ -352,6 +357,9 @@ struct HstuAttentionBwdDQDKDVPipelineKRKTRVR
         using QGradBlockTileType  = decltype(gemm_4.MakeCBlockTile());
 
         index_t i_total_loops = 0;
+        auto null_randval_window = dropout.template MakeRandvalDramWindow<decltype(gemm_0)>(
+            null_randval_window_tmp, k_origin.at(number<0>{}));
+
         index_t seqlen_q_step = seqlen_q_start;
         static_assert(kQKHeaddim >= kK0, "kQKHeaddim should be equal or greater than kK0");
         static_assert(kM0 == kK1, "kM0 should equal to kK1");
@@ -435,6 +443,48 @@ struct HstuAttentionBwdDQDKDVPipelineKRKTRVR
                 };
                 set_tile_if(p, type_convert<AccDataType>(0.0f), is_masked_out);
                 set_tile_if(g, type_convert<AccDataType>(0.0f), is_masked_out);
+            }
+
+            // ---- dropout (SiLU 路) ----
+            // 与 softmax 路不同：drop_scale 对 p(->dV) 与 g(->dK/dQ) 是同一个均匀标量，
+            // 不存在「外层因子必须留纯 P」的约束 ⇒ 当场乘进 p 与 g，无需留两份 tile、
+            // 无需重排 stage（DROP-D-SILU.md §Q2/§Q5）。
+            //   base: dS = (drop_scale·dP) * scale_p * dsilu(S)
+            //   ours: ds = dP * (drop_scale·g)，g 已含 scale_p*dsilu ⇒ 标量结合律等价。
+            //
+            // 施加顺序：base 是 dropout 先、mask 清零后；这里是 mask 清零先、dropout 后。
+            // 二者等价，因为 (1) drop_mask 由独立的 +1 哨兵 tile 生成，与 p/g 的值无关，
+            // (2) 被 mask 清零的位置两种顺序都终止于 0（0*rp_undrop == 0）。
+            // 【已推理，未数值验证 —— 留给对拍撞】
+            //
+            // 🔴 S 可以为负 ⇒ 必须用独立 int8_t 哨兵 tile 编码 keep/drop，
+            // 不能像 softmax 路那样靠 P 恒非负的符号复用。
+            if constexpr(kHasDropout)
+            {
+                auto drop_mask =
+                    make_static_distributed_tensor<int8_t>(p.get_tile_distribution());
+                tile_elementwise_inout([](auto& x) { x = type_convert<int8_t>(1); }, drop_mask);
+                dropout.template Run<decltype(gemm_0), uint8_t>(
+                    seqlen_q_step, k_origin.at(number<0>{}), drop_mask, null_randval_window);
+                move_tile_window(null_randval_window, {kM0, 0});
+
+                constexpr auto dr_spans = decltype(p)::get_distributed_spans();
+                sweep_tile_span(dr_spans[number<0>{}], [&](auto idx0) {
+                    sweep_tile_span(dr_spans[number<1>{}], [&](auto idx1) {
+                        constexpr auto ij = make_tuple(idx0, idx1);
+                        if(drop_mask[ij] > 0)
+                        {
+                            p(ij) = p[ij] * dropout.rp_undrop;
+                            g(ij) = g[ij] * dropout.rp_undrop;
+                        }
+                        else
+                        {
+                            // dsilu(0)=0.5 != 0 ⇒ g 必须显式置 0，不能指望 s=0 自动归零。
+                            p(ij) = type_convert<AccDataType>(0.0f);
+                            g(ij) = type_convert<AccDataType>(0.0f);
+                        }
+                    });
+                });
             }
 
             const auto p_gemm = cast_tile<GemmDataType>(p);
