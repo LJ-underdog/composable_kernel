@@ -385,6 +385,11 @@ struct HstuAttentionBwdDQDKDVPipelineKRKTRVR
         // [align_down(i_x), seqlen) also spans the gap between them. Gap tiles lie entirely
         // outside the mask: p and g are cleared below and they contribute nothing to
         // dK/dV/dQ, yet they still pay the whole GEMM chain plus a per-pixel mask sweep.
+        // With min_full_attn_seqlen == 0 there is no tail and hence no gap, but the envelope
+        // is still far too wide whenever contextual_seqlen > 0: ctx_rows collapses y_start to
+        // 0 (hstu_block_masking.hpp:539-546) independently of min_full_attn_seqlen, so the
+        // envelope degenerates from the causal triangle to the full rectangle and case (2)
+        // below applies. That case is why this test is not restricted to min_full > 0.
         //
         // Conservative test for tile [i_m0, i_m0+kM0) x [i_x, i_x+kN0), in the clamped
         // row_id/col_id space of IsTokenPairInsideMask. With ctx_shift = contextual_seqlen-1
@@ -395,7 +400,11 @@ struct HstuAttentionBwdDQDKDVPipelineKRKTRVR
         //            row_id == 0 shortcut cannot fire
         //   guard B: i_m0 + kM0 - 1 < max_id - min_full_attn_seqlen -> no row reaches the
         //            min_full tail, and every row_id stays below max_id so the row bounds
-        //            are not loosened by clamping
+        //            are not loosened by clamping. With min_full_attn_seqlen == 0 it
+        //            degenerates to i_m0 + kM0 - 1 < max_id, which still carries the second
+        //            half of that statement -- this is what keeps the unclamped
+        //            i_m0 - ctx_shift in (1) a valid row_id lower bound, so guard B must
+        //            stay even though there is no tail to exclude
         //   (1) (i_m0 - ctx_shift) - c_hi > max_attn_len -> the tile sits BELOW the band
         //       (c_hi carries the same -ctx_shift as the rows: it bounds col_id, not the
         //        physical column, so the contextual shift must not be left out)
@@ -411,8 +420,6 @@ struct HstuAttentionBwdDQDKDVPipelineKRKTRVR
         const auto is_tile_fully_outside = [&](index_t i_m0) -> bool {
             if constexpr(FmhaMask::kUseLocal && !FmhaMask::kIsCrossAttention)
             {
-                if(mask.min_full_attn_seqlen <= 0)
-                    return false;
                 const index_t ctx_shift =
                     mask.contextual_seqlen > 0 ? mask.contextual_seqlen - 1 : 0;
                 if(i_m0 <= ctx_shift)
