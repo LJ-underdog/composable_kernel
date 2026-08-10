@@ -426,10 +426,96 @@ struct HstuAttentionWithSoftmaxBwdDQDKDVPipelineKRKTRVR
                                                                 : raw_lse;
         };
 
+        // Fully-outside Q tiles. GetTileRangeAlongY can only return ONE contiguous interval,
+        // but with min_full_attn_seqlen > 0 the Q rows that attend a given K tile are two
+        // disjoint segments (the local band and the min_full tail), so the returned envelope
+        // [align_down(i_x), seqlen) also spans the gap between them. Gap tiles lie entirely
+        // outside the mask: s_acc is set to -inf below so p == 0 and they contribute nothing
+        // to dK/dV/dQ, yet they still pay the whole GEMM chain plus a per-pixel mask sweep.
+        //
+        // Conservative test for tile [i_m0, i_m0+kM0) x [i_x, i_x+kN0), in the clamped
+        // row_id/col_id space of IsTokenPairInsideMask. With ctx_shift = contextual_seqlen-1
+        // (0 when there is no contextual scope), i_m0-ctx_shift / r_hi bound row_id and
+        // c_lo / c_hi bound col_id over the tile, for both the contextual and the plain
+        // clamp. Two guards, then two disjoint ways of being outside:
+        //   guard A: i_m0 > ctx_shift -> every row_id >= 1, so the contextual
+        //            row_id == 0 shortcut cannot fire
+        //   guard B: i_m0 + kM0 - 1 < max_id - min_full_attn_seqlen -> no row reaches the
+        //            min_full tail, and every row_id stays below max_id so the row bounds
+        //            are not loosened by clamping
+        //   (1) (i_m0 - ctx_shift) - c_hi > max_attn_len -> the tile sits BELOW the band
+        //       (c_hi carries the same -ctx_shift as the rows: it bounds col_id, not the
+        //        physical column, so the contextual shift must not be left out)
+        //   (2) c_lo - r_hi > max_attn_len -> the tile sits ABOVE it, i.e. strictly above
+        //       the diagonal. This is what ctx_rows drags in: with contextual_seqlen > 0
+        //       GetTileRangeAlongY collapses y_start to 0 (hstu_block_masking.hpp:539-546),
+        //       so the whole upper triangle enters the envelope even though it is
+        //       identically zero.
+        // Either way row_id != col_id (no row == col diagonal element is present) and
+        // |row_id - col_id| > max_attn_len while in_min_full_scope is false, so both
+        // branches of IsTokenPairInsideMask are false over the whole tile. A tile that is
+        // not provably outside returns false and is processed exactly as before.
+        const auto is_tile_fully_outside = [&](index_t i_m0) -> bool {
+            if constexpr(FmhaMask::kUseLocal && !FmhaMask::kIsCrossAttention)
+            {
+                if(mask.min_full_attn_seqlen <= 0)
+                    return false;
+                const index_t ctx_shift =
+                    mask.contextual_seqlen > 0 ? mask.contextual_seqlen - 1 : 0;
+                if(i_m0 <= ctx_shift)
+                    return false;
+                if(i_m0 + kM0 - 1 >= mask.max_id - mask.min_full_attn_seqlen)
+                    return false;
+                index_t c_hi = k_origin.at(number<0>{}) + kN0 - 1 - ctx_shift;
+                if(c_hi < 0)
+                    c_hi = 0;
+                if(c_hi > mask.max_id)
+                    c_hi = mask.max_id;
+                index_t c_lo = k_origin.at(number<0>{}) - ctx_shift;
+                if(c_lo < 0)
+                    c_lo = 0;
+                if(c_lo > mask.max_id)
+                    c_lo = mask.max_id;
+                index_t r_hi = i_m0 + kM0 - 1 - ctx_shift;
+                if(r_hi > mask.max_id)
+                    r_hi = mask.max_id;
+                return (i_m0 - ctx_shift - c_hi > mask.max_attn_len) ||
+                       (c_lo - r_hi > mask.max_attn_len);
+            }
+            else
+            {
+                return false;
+            }
+        };
+
         __builtin_amdgcn_sched_barrier(0);
         // Hot loop over Q tiles
         while(i_total_loops < num_total_loop)
         {
+            if(is_tile_fully_outside(seqlen_q_step))
+            {
+                if constexpr(kIsDeterministic)
+                {
+                    // deterministic dQ sets its per-split slot instead of accumulating, so a
+                    // skipped tile must still write its slot -- with zeros.
+                    auto dq_acc_zero = QGradBlockTileType{};
+                    clear_tile(dq_acc_zero);
+                    store_tile(dq_dram_window, dq_acc_zero);
+                }
+                move_tile_window(q_dram_window, {kM0, 0});
+                move_tile_window(lse_dram_window, {kM0});
+                move_tile_window(do_dram_window, {kM0, 0});
+                move_tile_window(d_dram_window, {kM0});
+                move_tile_window(dq_dram_window, {kM0, 0});
+                if constexpr(kHasDropout)
+                {
+                    move_tile_window(null_randval_window, {kM0, 0});
+                }
+                i_total_loops += 1;
+                seqlen_q_step += kM0;
+                continue;
+            }
+
             auto q_block_tile = load_tile(q_dram_window);
             move_tile_window(q_dram_window, {kM0, 0});
 
