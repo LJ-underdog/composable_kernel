@@ -40,12 +40,6 @@ struct group_forward_dispatch
                                     HstuAttentionWithSoftmaxFwdTileSetting<MaxK, MTile>,
                                     HstuAttentionNoSoftmaxFwdTileSetting<MaxK, MTile>>::Type;
 
-#if defined(BUILD_HSTU_FOR_GFX95) || defined(BUILD_HSTU_FOR_GFX125)
-    static constexpr bool use_trload_pipeline = true;
-#else
-    static constexpr bool use_trload_pipeline = false;
-#endif
-
     template <bool kIsCrossAttention>
     using HstuPipelineProblemTemp = ck_tile::HstuAttentionFwdPipelineProblem<
         InOutDataType,
@@ -91,7 +85,13 @@ struct group_forward_dispatch
             BOOL_SWITCH(param.is_cross_attention, kIsCrossAttention, [&] {
                 using HstuPipelineProblem = HstuPipelineProblemTemp<kIsCrossAttention>;
 
-                if constexpr(!use_trload_pipeline)
+                constexpr auto kPipelineKind = get_hstu_fwd_pipeline_kind<kUseSoftmax,
+                                                                         kHasDropout,
+                                                                         kPadHeadDimQK,
+                                                                         kPadHeadDimV,
+                                                                         MaxK>();
+
+                if constexpr(kPipelineKind == HstuFwdPipelineKind::Default)
                 {
                     using HstuPipeline = std::conditional_t<
                         kUseSoftmax,
@@ -106,6 +106,8 @@ struct group_forward_dispatch
                 }
                 else
                 {
+                    // group has no Tdm branch yet, so Tdm lands here as well - same trload
+                    // pipeline this dispatch has always used on gfx1250.
                     using HstuPipeline = std::conditional_t<
                         kUseSoftmax,
                         ck_tile::HstuAttentionWithSoftmaxFwdPipelineQRKSVSTrLoad<
