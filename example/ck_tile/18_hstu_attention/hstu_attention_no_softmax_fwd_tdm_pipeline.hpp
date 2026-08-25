@@ -72,6 +72,15 @@ struct HstuAttentionNoSoftmaxFwdPipelineQRKSVSTdm
     static constexpr bool kPadHeadDimQK = Traits::kPadHeadDimQK;
     static constexpr bool kPadHeadDimV  = Traits::kPadHeadDimV;
 
+    // More guard-rails matching the dispatch gating (see the kHasDropout one above).
+    static_assert(kQKHeaddim == 128,
+                  "hstu no-softmax tdm pipeline is only gated in for MaxK == 128; other tile "
+                  "settings break the kN0 == kN0Sub == kK1 == 32 assumption baked into it");
+    static_assert(!kPadHeadDimQK && !kPadHeadDimV,
+                  "hstu no-softmax tdm pipeline cannot run with a padded head dim: its "
+                  "out-of-bound clamping uses the pad_tensor_view lengths (rounded up to the "
+                  "tile), so it DMAs past the end of K/V and page-faults on the GPU");
+
     // last dimension vector length used to create tensor view(and decide buffer_load vector length)
     // ... together with tensor distribution. tensor dist should able to overwrite this
     static constexpr index_t kAlignmentQ =

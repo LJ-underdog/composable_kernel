@@ -107,7 +107,11 @@ struct batched_forward_dispatch
                 BOOL_SWITCH(param.is_cross_attention, kIsCrossAttention, [&] {
                     using HstuPipelineProblem = HstuPipelineProblemTemp<kIsCrossAttention>;
 
-                    if constexpr(use_tdm_pipeline)
+                    // kPadHeadDim* are BOOL_SWITCH-local constexpr, so the head-dim part of
+                    // the tdm gating has to live here rather than next to use_tdm_pipeline.
+                    // TDM clamps out-of-bound reads against the (padded) tensor view lengths,
+                    // which makes it read past the end of K/V - falls back to trload.
+                    if constexpr(use_tdm_pipeline && !kPadHeadDimQK && !kPadHeadDimV)
                     {
                         // gating guarantees kUseSoftmax == false here
                         using HstuPipeline =
