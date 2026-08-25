@@ -125,7 +125,7 @@ struct HstuAttentionNoSoftmaxFwdPipelineQRKSVSTdm
 
     CK_TILE_DEVICE static constexpr ck_tile::index_t GetSmemSize()
     {
-        return Policy::template GetSmemSize<Problem, true /*kPipelineUseTrLoad*/>();
+        return Policy::template GetSmemSize<Problem, true /*kPipelineUseTrLoad*/, kUsePlainLds>();
     }
 
     template <typename QDramBlockWindowTmp,
@@ -212,12 +212,19 @@ struct HstuAttentionNoSoftmaxFwdPipelineQRKSVSTdm
                              Policy::template MakeKDramTileDistribution<Problem,
                                                                         kTrivialTileMajorDram>());
 
-        // TDM descriptor config for the K/V global->LDS DMA. LDS padding stays disabled:
-        // the writer-side padding would misalign the plain row-major LDS readers, and it
-        // is a bank-conflict perf optimization rather than a correctness requirement --
-        // exactly what the upstream qr_tdm policy does (all three GetLdsPaddingConfig*
-        // return (false, 0, 0)). A default-constructed TDMConfig already encodes that.
-        const TDMConfig tdm_config_kv{};
+        // TDM descriptor config for the K/V global->LDS DMA. The hardware LDS padding is
+        // enabled so that the plain row-major LDS row stride stops being a multiple of the
+        // 256 B LDS bank wrap-around; the reader-side descriptors carry the very same
+        // padded stride (Policy::GetPlainLdsPadElements). K and V share one config, which
+        // is why the padding is only enabled when their row lengths match.
+        TDMConfig tdm_config_kv{};
+        if constexpr(Policy::template GetPlainLdsPadElements<Problem>() != 0)
+        {
+            tdm_config_kv.pad_enable            = true;
+            tdm_config_kv.pad_config.pad_amount = Policy::kTdmLdsPadAmount;
+            tdm_config_kv.pad_config.pad_interval =
+                Policy::template GetPlainLdsPadInterval<Problem>();
+        }
 
         // provide partition_index for LDS tile window so that warp_id is in vgpr
         array<index_t, 2> partition_index{get_warp_id<false>(), get_lane_id()};
@@ -473,7 +480,9 @@ struct HstuAttentionNoSoftmaxFwdPipelineQRKSVSTdm
 
                 auto randval_lds_ptr =
                     reinterpret_cast<char*>(smem_ptr) +
-                    Policy::template GetSmemSizeKV<Problem, true /*kPipelineUseTrLoad*/>();
+                    Policy::template GetSmemSizeKV<Problem,
+                                                   true /*kPipelineUseTrLoad*/,
+                                                   kUsePlainLds>();
 
                 dropout.template Run<Gemm0Combined, CompDataType, uint8_t>(
                     randval_lds_ptr, seqlen_k_curr, pcomp_tile, null_randval_window);

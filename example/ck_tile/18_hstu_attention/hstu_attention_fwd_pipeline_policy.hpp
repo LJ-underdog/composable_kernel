@@ -146,7 +146,54 @@ struct HstuAttentionFwdPipelineQRKSVSPolicy
         };
     }
 
+    // ---- TDM hardware LDS padding (plain-LDS / TDM pipeline only) -------------------
+    // D#.pad_amount field value P: hardware inserts (P + 1) DWORDs of padding after every
+    // pad_interval DWORDs of source data. Encoding of both fields follows
+    // gemm_universal_pipeline_ag_bg_cr_policy.hpp:1160-1170 / :1221-1226 (the gfx1250 gemm
+    // tr-load path) and rocm-ref/topics/tensor-dma.md:169-172,313-323.
+    // Set kTdmLdsPadEnable=false to fall back to the un-padded plain layout.
+    static constexpr bool kTdmLdsPadEnable    = true;
+    static constexpr index_t kTdmLdsPadAmount = 7; // (7+1) DWORDs = 32 B per LDS row
+
+    // padding inserted per LDS row, in elements
     template <typename Problem>
+    CK_TILE_HOST_DEVICE static constexpr index_t GetPlainLdsPadElements()
+    {
+        constexpr index_t kQKHeaddim = Problem::HstuAttentionTileSetting::kQKHeaddim;
+        constexpr index_t kN1        = Problem::HstuAttentionTileSetting::kN1;
+
+        // one pad_interval must describe both the K row (kQKHeaddim) and the V row (kN1),
+        // because a single TDM descriptor config drives both loads
+        if constexpr(kTdmLdsPadEnable && kQKHeaddim == kN1)
+        {
+            return (kTdmLdsPadAmount + 1) * static_cast<index_t>(sizeof(int32_t)) /
+                   static_cast<index_t>(sizeof(typename Problem::QKVDataType));
+        }
+        else
+        {
+            return 0;
+        }
+    }
+
+    // D#.pad_interval field value: pad every 2^(N+1) DWORDs, i.e. exactly one LDS row
+    template <typename Problem>
+    CK_TILE_HOST_DEVICE static constexpr index_t GetPlainLdsPadInterval()
+    {
+        constexpr index_t row_dwords = Problem::HstuAttentionTileSetting::kQKHeaddim *
+                                       static_cast<index_t>(sizeof(typename Problem::QKVDataType)) /
+                                       static_cast<index_t>(sizeof(int32_t));
+
+        index_t n = 0;
+        index_t x = row_dwords;
+        while(x > 1)
+        {
+            x >>= 1;
+            n++;
+        }
+        return n - 1;
+    }
+
+    template <typename Problem, bool kPlainLds = false>
     CK_TILE_HOST_DEVICE static constexpr auto GetKSingleSmemElementSpaceSize()
     {
         constexpr index_t kNPerBlock = Problem::HstuAttentionTileSetting::kN0Sub;
@@ -154,8 +201,12 @@ struct HstuAttentionFwdPipelineQRKSVSPolicy
         constexpr index_t kKPack     = GetSmemKPackK<Problem>();
         constexpr index_t kKVector   = GetAlignmentK<Problem>();
 
+        if constexpr(kPlainLds)
+        {
+            return kNPerBlock * (kKPerBlock + GetPlainLdsPadElements<Problem>());
+        }
         // for hdim96 and hdim160
-        if constexpr(!detail::IsPerfectHeaddimSize(kKPerBlock))
+        else if constexpr(!detail::IsPerfectHeaddimSize(kKPerBlock))
         {
             return kKPerBlock * kNPerBlock;
         }
@@ -173,13 +224,18 @@ struct HstuAttentionFwdPipelineQRKSVSPolicy
         };
     };
 
-    template <typename Problem, bool kUseTrLoad = false>
+    template <typename Problem, bool kUseTrLoad = false, bool kPlainLds = false>
     CK_TILE_HOST_DEVICE static constexpr auto GetVSingleSmemElementSpaceSize()
     {
         constexpr index_t kNPerBlock = Problem::HstuAttentionTileSetting::kN1;
         constexpr index_t kKPerBlock = Problem::HstuAttentionTileSetting::kK1;
 
-        if constexpr(!kUseTrLoad)
+        if constexpr(kPlainLds)
+        {
+            // plain V layout is [kK1 rows, kN1 elements/row]; padding lengthens the row
+            return kKPerBlock * (kNPerBlock + GetPlainLdsPadElements<Problem>());
+        }
+        else if constexpr(!kUseTrLoad)
         {
             constexpr index_t N1     = GetAlignmentV<Problem>();
             constexpr index_t N0     = kNPerBlock / N1;
@@ -193,17 +249,18 @@ struct HstuAttentionFwdPipelineQRKSVSPolicy
         };
     };
 
-    template <typename Problem, bool kPipelineUseTrLoad = false>
+    template <typename Problem, bool kPipelineUseTrLoad = false, bool kPlainLds = false>
     CK_TILE_HOST_DEVICE static constexpr auto GetSingleSmemElementSpaceSize()
     {
-        return max(GetKSingleSmemElementSpaceSize<Problem>(),
-                   GetVSingleSmemElementSpaceSize<Problem, kPipelineUseTrLoad>());
+        return max(GetKSingleSmemElementSpaceSize<Problem, kPlainLds>(),
+                   GetVSingleSmemElementSpaceSize<Problem, kPipelineUseTrLoad, kPlainLds>());
     };
 
     // kPlainLds: return the un-swizzled (plain row-major) layout. Required by the TDM
     // pipeline -- box-major DMA writes LDS linearly and cannot produce an XOR'd layout,
-    // so writer and reader must share this plain descriptor. The element space size is
-    // identical to the XOR path, so GetSmemSize* need no plain-specific branch.
+    // so writer and reader must share this plain descriptor. With kTdmLdsPadEnable the
+    // rows also carry the TDM hardware padding, which grows the element space -- hence
+    // GetSmemSize* / GetSingleSmemElementSpaceSize all take the same kPlainLds flag.
     template <typename Problem, bool kPipelineUseTrLoad = false, bool kPlainLds = false>
     CK_TILE_HOST_DEVICE static constexpr auto MakeKLdsBlockDescriptor()
     {
@@ -214,19 +271,25 @@ struct HstuAttentionFwdPipelineQRKSVSPolicy
         constexpr index_t kKVector       = GetAlignmentK<Problem>();
 
         constexpr index_t SingleSmemElementSpaceSize =
-            GetSingleSmemElementSpaceSize<Problem, kPipelineUseTrLoad>();
+            GetSingleSmemElementSpaceSize<Problem, kPipelineUseTrLoad, kPlainLds>();
 
         // for hdim96 and hdim160, use simplest layout; the TDM pipeline reuses the very
         // same plain layout for every hdim (see kPlainLds above)
         if constexpr(!detail::IsPerfectHeaddimSize(kKPerBlock) || kPlainLds)
         {
-            constexpr index_t KSingleSmemElementSpaceSize = kNPerBlock * kKPerBlock;
+            // kPlainLds: rows are lengthened by the TDM hardware padding so that the row
+            // stride is no longer a multiple of the 256 B LDS bank wrap-around
+            constexpr index_t KPadElems = kPlainLds ? GetPlainLdsPadElements<Problem>() : 0;
+            constexpr index_t KRowStride = kKPerBlock + KPadElems;
 
-            static_assert(KSingleSmemElementSpaceSize == GetKSingleSmemElementSpaceSize<Problem>());
+            constexpr index_t KSingleSmemElementSpaceSize = kNPerBlock * KRowStride;
+
+            static_assert(KSingleSmemElementSpaceSize ==
+                          GetKSingleSmemElementSpaceSize<Problem, kPlainLds>());
 
             constexpr auto k_lds_block_desc_0 = make_naive_tensor_descriptor(
                 make_tuple(number<NumKLdsBuffers>{}, number<kNPerBlock>{}, number<kKPerBlock>{}),
-                make_tuple(number<SingleSmemElementSpaceSize>{}, number<kKPerBlock>{}, number<1>{}),
+                make_tuple(number<SingleSmemElementSpaceSize>{}, number<KRowStride>{}, number<1>{}),
                 number<kKVector>{},
                 number<1>{});
 
@@ -440,7 +503,7 @@ struct HstuAttentionFwdPipelineQRKSVSPolicy
         constexpr index_t kKPerBlock     = Problem::HstuAttentionTileSetting::kK1;
 
         constexpr index_t SingleSmemElementSpaceSize =
-            GetSingleSmemElementSpaceSize<Problem, kUseTrLoad>();
+            GetSingleSmemElementSpaceSize<Problem, kUseTrLoad, kPlainLds>();
 
         if constexpr(!kUseTrLoad)
         {
@@ -492,15 +555,21 @@ struct HstuAttentionFwdPipelineQRKSVSPolicy
 
             if constexpr(kPlainLds)
             {
-                // Plain row-major [NumBuf, kK1, kN1] -> merged 2D. Same shape and same
-                // element space as the XOR path below, only without the swizzle, so the
-                // TDM writer and the ds_load_tr reader agree on the layout.
+                // Plain row-major [NumBuf, kK1, kN1] -> merged 2D, no swizzle, so the TDM
+                // writer and the ds_load_tr reader agree on the layout. With
+                // kTdmLdsPadEnable the row stride carries the TDM hardware padding.
+                constexpr index_t VPadElems  = GetPlainLdsPadElements<Problem>();
+                constexpr index_t VRowStride = kNPerBlock + VPadElems;
+
+                static_assert(kKPerBlock * VRowStride ==
+                              GetVSingleSmemElementSpaceSize<Problem, true, true>());
+
                 constexpr auto v_lds_block_desc_plain =
                     make_naive_tensor_descriptor(make_tuple(number<NumVLdsBuffers>{},
                                                             number<kKPerBlock>{},
                                                             number<kNPerBlock>{}),
                                                  make_tuple(number<SingleSmemElementSpaceSize>{},
-                                                            number<kNPerBlock>{},
+                                                            number<VRowStride>{},
                                                             number<1>{}),
                                                  number<kKPack>{},
                                                  number<1>{});
@@ -894,12 +963,13 @@ struct HstuAttentionFwdPipelineQRKSVSPolicy
         return WG::WarpGemmAttribute::Impl::kCM1PerLane;
     }
 
-    template <typename Problem, bool kPipelineUseTrLoad = false>
+    template <typename Problem, bool kPipelineUseTrLoad = false, bool kPlainLds = false>
     CK_TILE_HOST_DEVICE static constexpr ck_tile::index_t GetSmemSizeKV()
     {
         constexpr index_t num_kv_lds_buffers = GetNumKVLdsBuffers<Problem>();
 
-        return num_kv_lds_buffers * GetSingleSmemElementSpaceSize<Problem, kPipelineUseTrLoad>() *
+        return num_kv_lds_buffers *
+               GetSingleSmemElementSpaceSize<Problem, kPipelineUseTrLoad, kPlainLds>() *
                sizeof(typename Problem::QKVDataType);
     };
 
@@ -928,10 +998,11 @@ struct HstuAttentionFwdPipelineQRKSVSPolicy
         }
     };
 
-    template <typename Problem, bool kPipelineUseTrLoad = false>
+    template <typename Problem, bool kPipelineUseTrLoad = false, bool kPlainLds = false>
     CK_TILE_HOST_DEVICE static constexpr ck_tile::index_t GetSmemSize()
     {
-        return GetSmemSizeKV<Problem, kPipelineUseTrLoad>() + GetSmemSizeDropout<Problem>();
+        return GetSmemSizeKV<Problem, kPipelineUseTrLoad, kPlainLds>() +
+               GetSmemSizeDropout<Problem>();
     }
 };
 
