@@ -43,12 +43,25 @@ set_directory_properties(PROPERTIES CMAKE_CONFIGURE_DEPENDS "${CODE_GEN_SCRIPTS}
 list(JOIN INST_TARGETS , FMHA_TARGETS_ARG)
 
 string(REPLACE ";" "," FMHA_FWD_APIS "${FMHA_FWD_ENABLE_APIS}")
+
+# Narrow the generated fwd instance set to cut build time when bringing up a
+# single pipeline. Defaults reproduce the full instance set exactly, so leaving
+# both untouched is a no-op.
+set(FMHA_FWD_OPTDIM "32,64,80,128,256" CACHE STRING
+  "comma-separated hdim list passed to generate.py --optdim")
+set(FMHA_FWD_FILTER "" CACHE STRING
+  "fnmatch pattern passed to generate.py --filter; empty means no filtering")
+
 set(FMHA_FWD_CODE_GEN_COMMON_ARGS
   ${CMAKE_CURRENT_LIST_DIR}/generate.py
   --targets ${FMHA_TARGETS_ARG}
   --api ${FMHA_FWD_APIS}
-  --optdim 32,64,80,128,256
+  --optdim ${FMHA_FWD_OPTDIM}
 )
+if(NOT FMHA_FWD_FILTER STREQUAL "")
+  list(APPEND FMHA_FWD_CODE_GEN_COMMON_ARGS --filter ${FMHA_FWD_FILTER})
+  message(STATUS "FMHA fwd instance filter: ${FMHA_FWD_FILTER} (optdim ${FMHA_FWD_OPTDIM})")
+endif()
 set(FMHA_BWD_CODE_GEN_COMMON_ARGS
   ${CMAKE_CURRENT_LIST_DIR}/generate.py
   --targets ${FMHA_TARGETS_ARG}
@@ -64,7 +77,7 @@ set(FMHA_BWD_CODE_GEN_COMMON_ARGS
 # there is no corresponding instance for parameters).
 if(BUILD_TESTING)
   # Filters are in the order of FMHA_FWD_KNOWN_APIS: fwd,fwd_splitkv_combine@fwd_splitkv,fwd_appendkv,pagedkv_prefill
-  list(APPEND FMHA_FWD_CODE_GEN_COMMON_ARGS --filter *_nlogits*_nskip*_nsink*,*@*_nlogits*_nbias*_nsink*,*,*_nlogits*_nskip*_pagedkv*)
+  list(APPEND FMHA_FWD_CODE_GEN_COMMON_ARGS --filter *_nlogits*_nskip*,*@*_nlogits*_nbias*,*,*_nlogits*_nskip*_pagedkv*)
 endif()
 
 # generate a list of kernels, but not actually emit files at config sta

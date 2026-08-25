@@ -310,7 +310,12 @@ class FmhaFwdApiTrait:
     def scheck(self) -> str:
         if self.mode == "group":
             return "true/*group mode spad always true*/"  # group mode only generate spad/skpad == true
-        if self.pipeline_tag in ["qr_async", "qr_async_trload", "qr_async_trload_v3"]:
+        if self.pipeline_tag in [
+            "qr_async",
+            "qr_async_trload",
+            "qr_async_trload_v3",
+            "qr_tdm",
+        ]:
             if self.spad == "t":
                 return "true"  # always support
             else:
@@ -345,7 +350,7 @@ class FmhaFwdApiTrait:
                 return f"true /*a.seqlen_k % {self.bn0} != 0*/"  # TODO: order of get_pipelines() matters! (ugly)
             else:
                 return f"(a.cu_seqlen_k_ptr == nullptr) && (a.seqlen_k != 0 && a.seqlen_k % {self.bn0} == 0)"
-        elif self.pipeline_tag in ["qr_async_trload", "qr_async_trload_v3"]:
+        elif self.pipeline_tag in ["qr_async_trload", "qr_async_trload_v3", "qr_tdm"]:
             if self.skpad == "t":
                 return "true"
             else:
@@ -366,7 +371,13 @@ class FmhaFwdApiTrait:
                 return "a.hdim_q % 8 == 0"
             else:
                 assert False
-        elif self.pipeline_tag in ["qr", "qs", "qr_async_trload", "qr_async_trload_v3"]:
+        elif self.pipeline_tag in [
+            "qr",
+            "qs",
+            "qr_async_trload",
+            "qr_async_trload_v3",
+            "qr_tdm",
+        ]:
             bk0submax = K0_MAX_SUBMAX_MAP[self.bk0max]
             if self.dpad == "t":
                 return f"true /*a.hdim_q % {bk0submax} != 0*/"  # TODO: order of get_pipelines() matters! (ugly)
@@ -388,7 +399,13 @@ class FmhaFwdApiTrait:
                 return "a.hdim_v % 8 == 0"
             else:
                 assert False
-        elif self.pipeline_tag in ["qr", "qs", "qr_async_trload", "qr_async_trload_v3"]:
+        elif self.pipeline_tag in [
+            "qr",
+            "qs",
+            "qr_async_trload",
+            "qr_async_trload_v3",
+            "qr_tdm",
+        ]:
             bk0submax = K0_MAX_SUBMAX_MAP[self.bk0max]
             if self.dvpad == "t":
                 return f"true /*a.hdim_v % {bk0submax} != 0*/"  # TODO: order of get_pipelines() matters! (ugly)
@@ -1381,6 +1398,24 @@ class KernelComponentFactoryGfx125(CompatibilityRuleFactory):
         pipelines = []
         if dtype in cls._DT_FP16_BF16:
             qscale = "no"
+            # qr_tdm: gfx1250 TDM pipeline, preferred for d=128.
+            # Emitted first so runtime dispatcher selects qr_tdm over qr
+            # when both match (dispatch order = list order in generated code).
+            # NOTE: dropout is not yet implemented in qr_tdm -- only emit
+            # dropout="f" so dropout workloads fall through to qr.
+            if hdim == 128 and hdim_v == 128:
+                for logits, mask, bias, lse, sink in itertools.product(
+                    ["t", "f"],
+                    get_mask_map(mask_impl).keys(),
+                    BIAS_MAP.keys(),
+                    ["t", "f"],
+                    ["t", "f"],
+                ):
+                    pipelines.append(FmhaFwdPipeline("qr_tdm", "row", "f", "f", "f", "f", logits, bias, lse, "f", qscale, mask, "f", "f", sink))  # fmt: skip
+                    pipelines.append(FmhaFwdPipeline("qr_tdm", "row", "f", "f", "t", "t", logits, bias, lse, "f", qscale, mask, "f", "f", sink))  # fmt: skip
+
+            # qr: generic pipeline fallback for trait combos not covered by
+            # qr_tdm (e.g., bias, dropout, skip, d!=128).
             for logits, mask, bias, lse, dropout, skip, sink in itertools.product(
                 ["t", "f"],
                 get_mask_map(mask_impl).keys(),
