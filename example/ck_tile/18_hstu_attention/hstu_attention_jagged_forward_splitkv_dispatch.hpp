@@ -22,6 +22,7 @@
 #include "hstu_attention_no_softmax_fwd_pipeline.hpp"
 #include "hstu_attention_with_softmax_fwd_trload_pipeline.hpp"
 #include "hstu_attention_no_softmax_fwd_trload_pipeline.hpp"
+#include "hstu_attention_no_softmax_fwd_tdm_pipeline.hpp"
 #include "hstu_attention_no_softmax_fwd_splitkv_combine_pipeline.hpp"
 #include "hstu_attention_with_softmax_fwd_splitkv_combine_pipeline.hpp"
 #include "hstu_attention_fwd_splitkv_kernel.hpp"
@@ -44,12 +45,6 @@ struct jagged_forward_splitkv_dispatch
                                     HstuAttentionWithSoftmaxFwdTileSetting<MaxK, MTile>,
                                     HstuAttentionNoSoftmaxFwdTileSetting<MaxK, MTile>>::Type;
     using HstuAttentionCombineTileSetting = HstuAttentionFwdSplitKVCombineTileSetting<MaxK>::Type;
-
-#if defined(BUILD_HSTU_FOR_GFX95) || defined(BUILD_HSTU_FOR_GFX125)
-    static constexpr bool use_trload_pipeline = true;
-#else
-    static constexpr bool use_trload_pipeline = false;
-#endif
 
     template <bool kIsCrossAttention>
     using HstuFwdPipelineProblemTemp = ck_tile::HstuAttentionFwdPipelineProblem<
@@ -116,7 +111,25 @@ struct jagged_forward_splitkv_dispatch
                 BOOL_SWITCH(param.is_cross_attention, kIsCrossAttention, [&] {
                     using HstuPipelineProblem = HstuFwdPipelineProblemTemp<kIsCrossAttention>;
 
-                    if constexpr(!use_trload_pipeline)
+                    constexpr auto kPipelineKind = get_hstu_fwd_pipeline_kind<kUseSoftmax,
+                                                                             kHasDropout,
+                                                                             kPadHeadDimQK,
+                                                                             kPadHeadDimV,
+                                                                             MaxK>();
+
+                    if constexpr(kPipelineKind == HstuFwdPipelineKind::Tdm)
+                    {
+                        // gating guarantees kUseSoftmax == false here
+                        using HstuPipeline =
+                            ck_tile::HstuAttentionNoSoftmaxFwdPipelineQRKSVSTdm<HstuPipelineProblem,
+                                                                                HstuTraits>;
+
+                        using HstuKernel =
+                            ck_tile::HstuAttentionFwdSplitKVKernel<HstuPipeline, HstuEpilogue>;
+
+                        RunWithFwdSplitKVKernel<HstuKernel>(param, ws, stream);
+                    }
+                    else if constexpr(kPipelineKind == HstuFwdPipelineKind::Default)
                     {
                         using HstuPipeline = std::conditional_t<
                             kUseSoftmax,
