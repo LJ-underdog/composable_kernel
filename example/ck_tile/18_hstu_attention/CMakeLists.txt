@@ -6,12 +6,43 @@ list(APPEND EXAMPLE_HSTU_ATTENTION_COMPILE_OPTIONS -Wno-undefined-func-template 
 if(GPU_TARGETS MATCHES "gfx95" AND NOT GPU_TARGETS MATCHES "gfx94" AND NOT GPU_TARGETS MATCHES "gfx90")
     ## disable slp-vectorize improve pipelines performance on gfx950
     list(APPEND EXAMPLE_HSTU_ATTENTION_COMPILE_OPTIONS -DBUILD_HSTU_FOR_GFX95 -fno-slp-vectorize)
+elseif(GPU_TARGETS MATCHES "gfx125" AND NOT GPU_TARGETS MATCHES "gfx94" AND NOT GPU_TARGETS MATCHES "gfx90")
+    list(APPEND EXAMPLE_HSTU_ATTENTION_COMPILE_OPTIONS -DBUILD_HSTU_FOR_GFX125)
 else()
     list(APPEND EXAMPLE_HSTU_ATTENTION_COMPILE_OPTIONS -DBUILD_HSTU_FOR_GFX94)
 endif()
 
+# Fast-iteration build for the forward path.
+# When ON, only the softmax=false + dropout=false instances are compiled (48 of 288),
+# and the fwd interface TUs stop instantiating the softmax/dropout branches so that the
+# link set matches. Selected branches behave identically to a full build; requesting
+# -softmax=1 or -p_drop>0 at runtime fails loudly instead of silently taking a wrong path.
+# NOTE: fwd-only. tile_example_hstu_attention_bwd links against hstufwd and will NOT
+#       link while this is ON.
+option(HSTU_FWD_MINIMAL_INSTANCES
+       "Compile only softmax=false + dropout=false fwd instances (fast iteration)" OFF)
+
+# Wider variant of the same mechanism: keep every softmax=false instance, dropout included
+# (96 of 288), and drop only the softmax branch. Used to validate the full no-softmax (SiLU)
+# surface while the softmax instances are still broken on gfx1250. Mutually exclusive with
+# HSTU_FWD_MINIMAL_INSTANCES, which takes precedence.
+option(HSTU_FWD_NO_SOFTMAX_INSTANCES
+       "Compile all softmax=false fwd instances, dropout included" OFF)
+
 # Source lists for the forward path
-file(GLOB FWD_INSTANCE_SRCS instances/*_forward_*.cpp)
+if(HSTU_FWD_MINIMAL_INSTANCES)
+    file(GLOB FWD_INSTANCE_SRCS instances/*_forward_*softmax_false*no_dropout*.cpp)
+    list(APPEND EXAMPLE_HSTU_ATTENTION_COMPILE_OPTIONS -DHSTU_FWD_MINIMAL_INSTANCES)
+    list(LENGTH FWD_INSTANCE_SRCS _HSTU_FWD_N_INSTANCES)
+    message(STATUS "HSTU_FWD_MINIMAL_INSTANCES=ON: ${_HSTU_FWD_N_INSTANCES} fwd instances (softmax=false, dropout=false)")
+elseif(HSTU_FWD_NO_SOFTMAX_INSTANCES)
+    file(GLOB FWD_INSTANCE_SRCS instances/*_forward_*softmax_false*.cpp)
+    list(APPEND EXAMPLE_HSTU_ATTENTION_COMPILE_OPTIONS -DHSTU_FWD_NO_SOFTMAX_INSTANCES)
+    list(LENGTH FWD_INSTANCE_SRCS _HSTU_FWD_N_INSTANCES)
+    message(STATUS "HSTU_FWD_NO_SOFTMAX_INSTANCES=ON: ${_HSTU_FWD_N_INSTANCES} fwd instances (softmax=false, dropout=true/false)")
+else()
+    file(GLOB FWD_INSTANCE_SRCS instances/*_forward_*.cpp)
+endif()
 set(FWD_INTERFACE_SRCS  hstu_attention_no_group_forward_bf16.cpp  hstu_attention_no_group_forward_fp16.cpp hstu_attention_group_forward_bf16.cpp hstu_attention_group_forward_fp16.cpp)
 
 # Source lists for the backward path

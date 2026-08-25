@@ -3,6 +3,7 @@
 
 #include "hstu_attention_bool_switch.hpp"
 #include "hstu_attention_hdim_switch.hpp"
+#include "hstu_attention_minimal_instances.hpp"
 
 #include "instances/hstu_attention_batched_forward_bf16_instances_ref.hpp"
 #include "instances/hstu_attention_jagged_forward_bf16_instances_ref.hpp"
@@ -13,12 +14,16 @@ void hstu_attention_no_group_forward_bf16(HstuAttentionNoGroupFwdParams& param, 
     bool store_lse        = (param.use_softmax && param.is_training);
     bool has_dropout      = (param.p_drop > 0.0f);
 
+    if(hstu_fwd_minimal_reject(param.use_softmax, param.p_drop, __func__))
+        return;
+
     constexpr bool kHasBias = false;
     BOOL_SWITCH_3(
         use_causal, kUseCausal, param.use_softmax, kUseSoftmax, has_dropout, kHasDropout, [&] {
             HDIM_SWITCH(param.hdim_qk, param.hdim_v, MaxK, [&] {
                 BOOL_SWITCH(store_lse, kStoreLSE, [&] {
-                    if constexpr(kUseSoftmax || !kStoreLSE)
+                    if constexpr(hstu_fwd_keep_instance<kUseSoftmax, kHasDropout>() &&
+                                 (kUseSoftmax || !kStoreLSE))
                     {
                         if(param.is_jagged)
                             run_jagged_forward_dispatch<ck_tile::bf16_t,
