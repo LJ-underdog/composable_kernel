@@ -316,20 +316,57 @@ struct HstuAttentionNoSoftmaxFwdPipelineQRKSVSTdm
 
         auto seqlen_k_curr = seqlen_k_start;
 
+        // Running K one stage ahead (issued during the previous iteration's gemm_1) only
+        // pays off without a causal mask. Measured on gfx1250, b=512/64, hdim 128: the
+        // K prefetch gains 7.9% (seqlen 128) / 10.7% (seqlen 1024) without a mask but
+        // costs 4.9% / 7.6% with one, so it is gated on the mask mode. The V prefetch
+        // below is unconditional -- it wins in every measured configuration.
+        constexpr bool kPrefetchK = !kHasCausal;
+
+        if constexpr(kPrefetchK)
+        {
+            load_tile_tdm(tdm_config_kv, k_lds_windows[number<0>{}], k_dram_window);
+            move_tile_window(k_dram_window, {kN0Sub, 0});
+        }
+
         do
         {
             // STAGE 1, Gemm_0 ( S = Q@K )
             static_for<0, n0_loops, 1>{}([&](auto i_n0) {
                 // K goes global -> LDS through the TDM engine, no register staging.
+                if constexpr(!kPrefetchK)
+                {
+                    load_tile_tdm(tdm_config_kv,
+                                  k_lds_windows[number<i_n0 % NumKVLdsBuffers>{}],
+                                  k_dram_window);
+                    move_tile_window(k_dram_window, {kN0Sub, 0});
+
+                    __builtin_amdgcn_sched_barrier(0x00000001);
+                }
+
+                // TDM writes are tracked by tensorcnt, not vmcnt. When K is prefetched,
+                // the only descriptors still in flight ahead of K[i_n0] are the i_n0 V
+                // transfers issued below, and TDM retires them in order within a wave.
+                s_wait_tensorcnt_barrier<kPrefetchK ? index_t{i_n0} : 0>();
+
+                if constexpr(kPrefetchK && i_n0 + 1 < n0_loops)
+                {
+                    load_tile_tdm(tdm_config_kv,
+                                  k_lds_windows[number<(i_n0 + 1) % NumKVLdsBuffers>{}],
+                                  k_dram_window);
+                    move_tile_window(k_dram_window, {kN0Sub, 0});
+                }
+
+                // Issue the matching V DMA right here instead of in STAGE 3: its LDS
+                // buffer ((i+2)%4) is disjoint from the K buffers, and the barrier just
+                // above is the WAR fence against the previous iteration's gemm_1 reads.
+                // The transfer then overlaps gemm_0 + the whole of STAGE 2.
                 load_tile_tdm(tdm_config_kv,
-                              k_lds_windows[number<i_n0 % NumKVLdsBuffers>{}],
-                              k_dram_window);
-                move_tile_window(k_dram_window, {kN0Sub, 0});
+                              v_lds_windows[number<(i_n0 + 2) % NumKVLdsBuffers>{}],
+                              v_dram_window);
+                move_tile_window(v_dram_window, {kK1, 0});
 
                 __builtin_amdgcn_sched_barrier(0x00000001);
-
-                // TDM writes are tracked by tensorcnt, not vmcnt.
-                s_wait_tensorcnt_barrier<0>();
 
                 // execute current unroll of gemm_0
                 gemm_0(sacc_tile, q_tile, k_lds_windows[number<i_n0 % NumKVLdsBuffers>{}]);
@@ -417,15 +454,20 @@ struct HstuAttentionNoSoftmaxFwdPipelineQRKSVSTdm
 
             // STAGE 3, Gemm_1 ( O = P@V )
             static_for<0, k1_loops, 1>{}([&](auto i_k1) {
-                // V goes global -> LDS through the TDM engine, no register staging.
-                load_tile_tdm(tdm_config_kv,
-                              v_lds_windows[number<(i_k1 + 2) % NumKVLdsBuffers>{}],
-                              v_dram_window);
-                move_tile_window(v_dram_window, {kK1, 0});
+                // The V DMAs were all issued back in STAGE 1, in ascending i_k1 order.
+                // TDM descriptors retire in order within a wave, so V[i_k1] is done once
+                // at most the (k1_loops-1-i_k1) later ones are still outstanding.
+                s_wait_tensorcnt_barrier<k1_loops - 1 - i_k1>();
 
-                __builtin_amdgcn_sched_barrier(0x00000001);
-
-                s_wait_tensorcnt_barrier<0>();
+                // On the last unroll, prefetch K[0] of the next kv-tile so that its
+                // transfer overlaps this gemm_1. Issuing it behind the barrier above --
+                // rather than adding a barrier of its own -- is what makes that barrier
+                // double as the WAR fence against gemm_0's reads of the same LDS buffer.
+                if constexpr(kPrefetchK && i_k1 + 1 == k1_loops)
+                {
+                    load_tile_tdm(tdm_config_kv, k_lds_windows[number<0>{}], k_dram_window);
+                    move_tile_window(k_dram_window, {kN0Sub, 0});
+                }
 
                 __builtin_amdgcn_sched_barrier(0x00000001);
 
