@@ -200,7 +200,11 @@ struct HstuAttentionFwdPipelineQRKSVSPolicy
                    GetVSingleSmemElementSpaceSize<Problem, kPipelineUseTrLoad>());
     };
 
-    template <typename Problem, bool kPipelineUseTrLoad = false>
+    // kPlainLds: return the un-swizzled (plain row-major) layout. Required by the TDM
+    // pipeline -- box-major DMA writes LDS linearly and cannot produce an XOR'd layout,
+    // so writer and reader must share this plain descriptor. The element space size is
+    // identical to the XOR path, so GetSmemSize* need no plain-specific branch.
+    template <typename Problem, bool kPipelineUseTrLoad = false, bool kPlainLds = false>
     CK_TILE_HOST_DEVICE static constexpr auto MakeKLdsBlockDescriptor()
     {
         constexpr index_t NumKLdsBuffers = GetNumKVLdsBuffers<Problem>();
@@ -212,8 +216,9 @@ struct HstuAttentionFwdPipelineQRKSVSPolicy
         constexpr index_t SingleSmemElementSpaceSize =
             GetSingleSmemElementSpaceSize<Problem, kPipelineUseTrLoad>();
 
-        // for hdim96 and hdim160, use simplest layout
-        if constexpr(!detail::IsPerfectHeaddimSize(kKPerBlock))
+        // for hdim96 and hdim160, use simplest layout; the TDM pipeline reuses the very
+        // same plain layout for every hdim (see kPlainLds above)
+        if constexpr(!detail::IsPerfectHeaddimSize(kKPerBlock) || kPlainLds)
         {
             constexpr index_t KSingleSmemElementSpaceSize = kNPerBlock * kKPerBlock;
 
@@ -347,7 +352,13 @@ struct HstuAttentionFwdPipelineQRKSVSPolicy
         };
     }
 
-    template <typename Problem>
+    // kTrivialTileMajor: return the trivial tile-major distribution required by the TDM
+    // pipeline. TDM derives its hardware `box_dim` by reversing the dram window's
+    // ys_to_d lengths (tile_window.hpp:893-898), so the distribution must describe one
+    // contiguous rectangle per wave -- the default 5D lane-scatter form yields a scattered
+    // box whose LDS image the reader cannot interpret. Mirrors the ColMajor-B path of
+    // gemm_pipeline_ag_bg_cr_comp_tdm_default_policy.hpp:150-158.
+    template <typename Problem, bool kTrivialTileMajor = false>
     CK_TILE_HOST_DEVICE static constexpr auto MakeKDramTileDistribution()
     {
         constexpr index_t kBlockSize = Problem::kBlockSize;
@@ -357,7 +368,25 @@ struct HstuAttentionFwdPipelineQRKSVSPolicy
         constexpr index_t kKVector = GetAlignmentK<Problem>();
         constexpr index_t OtherK   = kKPerBlock / kKVector;
 
-        if constexpr(detail::IsPerfectHeaddimSize(kKPerBlock))
+        if constexpr(kTrivialTileMajor)
+        {
+            constexpr index_t warpNum = kBlockSize / get_warp_size();
+
+            static_assert(kNPerBlock % warpNum == 0,
+                          "kN0Sub must be divisible by warpNum for trivial tile-major K dist");
+
+            return make_static_tile_distribution(
+                tile_distribution_encoding<
+                    sequence<>,                                    // R: empty
+                    tuple<sequence<warpNum, kNPerBlock / warpNum>, // X[0]: K seq dim, warp split
+                          sequence<kKPerBlock>>, // X[1]: hdim, one full contiguous vector
+                    tuple<sequence<1>>,          // PsToRH: warp dim mapping
+                    tuple<sequence<0>>,          // PsToRH_lid
+                    sequence<1, 2>,              // YsToD outer
+                    sequence<1, 0>>{},           // YsToD inner
+                bool_constant<true>{});          // IsWarpLevelParallelOnly (TDM is wave-level)
+        }
+        else if constexpr(detail::IsPerfectHeaddimSize(kKPerBlock))
         // for kKPerBlock=32,64,128,256
         {
             static_assert((OtherK & (OtherK - 1)) == 0, "Check failed!");
@@ -400,7 +429,9 @@ struct HstuAttentionFwdPipelineQRKSVSPolicy
         };
     }
 
-    template <typename Problem, bool kUseTrLoad = false>
+    // kPlainLds: see MakeKLdsBlockDescriptor. Only meaningful on the kUseTrLoad path --
+    // the non-trload layout carries no XOR to begin with (it pads instead).
+    template <typename Problem, bool kUseTrLoad = false, bool kPlainLds = false>
     CK_TILE_HOST_DEVICE static constexpr auto MakeVLdsBlockDescriptor()
     {
         constexpr index_t NumVLdsBuffers = GetNumKVLdsBuffers<Problem>();
@@ -454,54 +485,104 @@ struct HstuAttentionFwdPipelineQRKSVSPolicy
         {
             constexpr index_t kKPack = GetSmemKPackV<Problem, true>();
 
-            constexpr auto XorGroupSize =
-                Problem::HstuAttentionTileSetting::Gemm1WarpTile::at(number<0>{});
-
             constexpr index_t VSingleSmemElementSpaceSize = kNPerBlock * kKPerBlock;
 
             static_assert(VSingleSmemElementSpaceSize ==
                           GetVSingleSmemElementSpaceSize<Problem, true>());
 
-            constexpr auto v_lds_block_desc_naive =
-                make_naive_tensor_descriptor(make_tuple(number<NumVLdsBuffers>{},
-                                                        number<kKPerBlock>{},
-                                                        number<kNPerBlock / XorGroupSize>{},
-                                                        number<XorGroupSize>{}),
-                                             make_tuple(number<SingleSmemElementSpaceSize>{},
-                                                        number<kNPerBlock>{},
-                                                        number<XorGroupSize>{},
-                                                        number<1>{}),
-                                             number<kKPack>{},
-                                             number<1>{});
+            if constexpr(kPlainLds)
+            {
+                // Plain row-major [NumBuf, kK1, kN1] -> merged 2D. Same shape and same
+                // element space as the XOR path below, only without the swizzle, so the
+                // TDM writer and the ds_load_tr reader agree on the layout.
+                constexpr auto v_lds_block_desc_plain =
+                    make_naive_tensor_descriptor(make_tuple(number<NumVLdsBuffers>{},
+                                                            number<kKPerBlock>{},
+                                                            number<kNPerBlock>{}),
+                                                 make_tuple(number<SingleSmemElementSpaceSize>{},
+                                                            number<kNPerBlock>{},
+                                                            number<1>{}),
+                                                 number<kKPack>{},
+                                                 number<1>{});
 
-            constexpr auto v_lds_block_desc_permuted = transform_tensor_descriptor(
-                v_lds_block_desc_naive,
-                make_tuple(make_pass_through_transform(number<NumVLdsBuffers>{}),
-                           make_xor_transform(make_tuple(number<kKPerBlock>{},
-                                                         number<kNPerBlock / XorGroupSize>{})),
-                           make_pass_through_transform(number<XorGroupSize>{})),
-                make_tuple(sequence<0>{}, sequence<1, 2>{}, sequence<3>{}),
-                make_tuple(sequence<0>{}, sequence<1, 2>{}, sequence<3>{}));
+                return transform_tensor_descriptor(
+                    v_lds_block_desc_plain,
+                    make_tuple(make_merge_transform(
+                                   make_tuple(number<NumVLdsBuffers>{}, number<kKPerBlock>{})),
+                               make_pass_through_transform(number<kNPerBlock>{})),
+                    make_tuple(sequence<0, 1>{}, sequence<2>{}),
+                    make_tuple(sequence<0>{}, sequence<1>{}));
+            }
+            else
+            {
+                constexpr auto XorGroupSize =
+                    Problem::HstuAttentionTileSetting::Gemm1WarpTile::at(number<0>{});
 
-            return transform_tensor_descriptor(
-                v_lds_block_desc_permuted,
-                make_tuple(make_merge_transform(
-                               make_tuple(number<NumVLdsBuffers>{}, number<kKPerBlock>{})),
-                           make_merge_transform_v3_division_mod(make_tuple(
-                               number<kNPerBlock / XorGroupSize>{}, number<XorGroupSize>{}))),
-                make_tuple(sequence<0, 1>{}, sequence<2, 3>{}),
-                make_tuple(sequence<0>{}, sequence<1>{}));
+                constexpr auto v_lds_block_desc_naive =
+                    make_naive_tensor_descriptor(make_tuple(number<NumVLdsBuffers>{},
+                                                            number<kKPerBlock>{},
+                                                            number<kNPerBlock / XorGroupSize>{},
+                                                            number<XorGroupSize>{}),
+                                                 make_tuple(number<SingleSmemElementSpaceSize>{},
+                                                            number<kNPerBlock>{},
+                                                            number<XorGroupSize>{},
+                                                            number<1>{}),
+                                                 number<kKPack>{},
+                                                 number<1>{});
+
+                constexpr auto v_lds_block_desc_permuted = transform_tensor_descriptor(
+                    v_lds_block_desc_naive,
+                    make_tuple(make_pass_through_transform(number<NumVLdsBuffers>{}),
+                               make_xor_transform(make_tuple(number<kKPerBlock>{},
+                                                             number<kNPerBlock / XorGroupSize>{})),
+                               make_pass_through_transform(number<XorGroupSize>{})),
+                    make_tuple(sequence<0>{}, sequence<1, 2>{}, sequence<3>{}),
+                    make_tuple(sequence<0>{}, sequence<1, 2>{}, sequence<3>{}));
+
+                return transform_tensor_descriptor(
+                    v_lds_block_desc_permuted,
+                    make_tuple(make_merge_transform(
+                                   make_tuple(number<NumVLdsBuffers>{}, number<kKPerBlock>{})),
+                               make_merge_transform_v3_division_mod(make_tuple(
+                                   number<kNPerBlock / XorGroupSize>{}, number<XorGroupSize>{}))),
+                    make_tuple(sequence<0, 1>{}, sequence<2, 3>{}),
+                    make_tuple(sequence<0>{}, sequence<1>{}));
+            }
         };
     }
 
-    template <typename Problem, bool kUseTrLoad = false>
+    // kTrivialTileMajor: see MakeKDramTileDistribution. Only meaningful on the kUseTrLoad
+    // path -- that is the orientation the TDM pipeline uses (V dram view untransposed, so
+    // the tile is kK1 seq rows x kN1 contiguous hdim elements).
+    template <typename Problem, bool kUseTrLoad = false, bool kTrivialTileMajor = false>
     CK_TILE_DEVICE static constexpr auto MakeVDramTileDistribution()
     {
         constexpr index_t kBlockSize = Problem::kBlockSize;
         constexpr index_t kNPerBlock = Problem::HstuAttentionTileSetting::kN1;
         constexpr index_t kKPerBlock = Problem::HstuAttentionTileSetting::kK1;
 
-        if constexpr(!kUseTrLoad)
+        if constexpr(kTrivialTileMajor)
+        {
+            static_assert(kUseTrLoad,
+                          "trivial tile-major V dist is only defined for the trload orientation");
+
+            constexpr index_t warpNum = kBlockSize / get_warp_size();
+
+            static_assert(kKPerBlock % warpNum == 0,
+                          "kK1 (V seq) must be divisible by warpNum for trivial tile-major V dist");
+
+            return make_static_tile_distribution(
+                tile_distribution_encoding<
+                    sequence<>,                                    // R: empty
+                    tuple<sequence<warpNum, kKPerBlock / warpNum>, // X[0]: V seq dim, warp split
+                          sequence<kNPerBlock>>, // X[1]: V hdim, one full contiguous vector
+                    tuple<sequence<1>>,          // PsToRH: warp dim mapping
+                    tuple<sequence<0>>,          // PsToRH_lid
+                    sequence<1, 2>,              // YsToD outer
+                    sequence<1, 0>>{},           // YsToD inner
+                bool_constant<true>{});          // IsWarpLevelParallelOnly (TDM is wave-level)
+        }
+        else if constexpr(!kUseTrLoad)
         {
             constexpr index_t NPerThread = GetAlignmentV<Problem>();
             constexpr index_t NThreads   = kNPerBlock / NPerThread;

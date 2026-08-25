@@ -19,6 +19,7 @@
 #include "hstu_attention_no_softmax_fwd_pipeline.hpp"
 #include "hstu_attention_with_softmax_fwd_trload_pipeline.hpp"
 #include "hstu_attention_no_softmax_fwd_trload_pipeline.hpp"
+#include "hstu_attention_no_softmax_fwd_tdm_pipeline.hpp"
 #include "hstu_attention_fwd_kernel.hpp"
 #include "hstu_attention_epilogue.hpp"
 
@@ -39,10 +40,19 @@ struct batched_forward_dispatch
                                     HstuAttentionWithSoftmaxFwdTileSetting<MaxK, MTile>,
                                     HstuAttentionNoSoftmaxFwdTileSetting<MaxK, MTile>>::Type;
 
-#ifdef BUILD_HSTU_FOR_GFX95
+#if defined(BUILD_HSTU_FOR_GFX95) || defined(BUILD_HSTU_FOR_GFX125)
     static constexpr bool use_trload_pipeline = true;
 #else
     static constexpr bool use_trload_pipeline = false;
+#endif
+
+    // gfx1250 TDM pipeline, preferred over trload where it applies. Everything it does
+    // not cover (softmax, dropout, MaxK != 128) falls back to trload below.
+    // Keep this gating in sync with the static_asserts inside the tdm pipeline.
+#if defined(BUILD_HSTU_FOR_GFX125)
+    static constexpr bool use_tdm_pipeline = !kUseSoftmax && !kHasDropout && (MaxK == 128);
+#else
+    static constexpr bool use_tdm_pipeline = false;
 #endif
 
     template <bool kIsCrossAttention>
@@ -97,7 +107,19 @@ struct batched_forward_dispatch
                 BOOL_SWITCH(param.is_cross_attention, kIsCrossAttention, [&] {
                     using HstuPipelineProblem = HstuPipelineProblemTemp<kIsCrossAttention>;
 
-                    if constexpr(!use_trload_pipeline)
+                    if constexpr(use_tdm_pipeline)
+                    {
+                        // gating guarantees kUseSoftmax == false here
+                        using HstuPipeline =
+                            ck_tile::HstuAttentionNoSoftmaxFwdPipelineQRKSVSTdm<HstuPipelineProblem,
+                                                                                HstuTraits>;
+
+                        using HstuKernel =
+                            ck_tile::HstuAttentionFwdKernel<HstuPipeline, HstuEpilogue>;
+
+                        RunWithKernel<HstuKernel>(param, stream);
+                    }
+                    else if constexpr(!use_trload_pipeline)
                     {
                         using HstuPipeline = std::conditional_t<
                             kUseSoftmax,
