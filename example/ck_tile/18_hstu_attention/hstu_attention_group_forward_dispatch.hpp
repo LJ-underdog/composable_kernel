@@ -19,6 +19,7 @@
 #include "hstu_attention_no_softmax_fwd_pipeline.hpp"
 #include "hstu_attention_with_softmax_fwd_trload_pipeline.hpp"
 #include "hstu_attention_no_softmax_fwd_trload_pipeline.hpp"
+#include "hstu_attention_no_softmax_fwd_tdm_pipeline.hpp"
 #include "hstu_attention_fwd_kernel.hpp"
 #include "hstu_attention_epilogue.hpp"
 
@@ -91,7 +92,18 @@ struct group_forward_dispatch
                                                                          kPadHeadDimV,
                                                                          MaxK>();
 
-                if constexpr(kPipelineKind == HstuFwdPipelineKind::Default)
+                if constexpr(kPipelineKind == HstuFwdPipelineKind::Tdm)
+                {
+                    // gating guarantees kUseSoftmax == false here
+                    using HstuPipeline =
+                        ck_tile::HstuAttentionNoSoftmaxFwdPipelineQRKSVSTdm<HstuPipelineProblem,
+                                                                            HstuTraits>;
+
+                    using HstuKernel = ck_tile::HstuAttentionFwdKernel<HstuPipeline, HstuEpilogue>;
+
+                    RunWithKernel<HstuKernel>(param, stream);
+                }
+                else if constexpr(kPipelineKind == HstuFwdPipelineKind::Default)
                 {
                     using HstuPipeline = std::conditional_t<
                         kUseSoftmax,
@@ -106,8 +118,6 @@ struct group_forward_dispatch
                 }
                 else
                 {
-                    // group has no Tdm branch yet, so Tdm lands here as well - same trload
-                    // pipeline this dispatch has always used on gfx1250.
                     using HstuPipeline = std::conditional_t<
                         kUseSoftmax,
                         ck_tile::HstuAttentionWithSoftmaxFwdPipelineQRKSVSTrLoad<
