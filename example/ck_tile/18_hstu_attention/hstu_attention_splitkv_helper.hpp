@@ -47,7 +47,10 @@ get_estimated_cu_coverage_ratio(int num_batches, int num_heads, int max_seqlen_q
     return static_cast<float>(nbatch_nhead_mblocks) / (2.0f * num_CUs);
 };
 
-static bool shall_use_splitkv(int num_batches, int num_heads, int max_seqlen_q, int max_seqlen_kv)
+// maybe_unused: the forward dispatches drop their call to this under
+// HSTU_FWD_DISABLE_SPLITKV, and the build runs -Werror -Wunused-function.
+[[maybe_unused]] static bool
+shall_use_splitkv(int num_batches, int num_heads, int max_seqlen_q, int max_seqlen_kv)
 {
     // Please tune the threshold here
     const float threshold = (max_seqlen_kv >= 8192) ? 3.0f : 0.8f;

@@ -228,6 +228,7 @@ void run_batched_forward_dispatch(HstuAttentionNoGroupFwdParams& param, hipStrea
                                  128>::Run(param, stream);
     else
     {
+#ifndef HSTU_FWD_DISABLE_SPLITKV
         // for cross-attention, we should give more opportunity to use split-kv since the seqlen_kv
         // is usually much bigger than seqlen_q, so the main-loop along the seqlen_kv have enough
         // iterations to counter-act the cost brought by splitting
@@ -262,6 +263,7 @@ void run_batched_forward_dispatch(HstuAttentionNoGroupFwdParams& param, hipStrea
                                                  64>::Run(param, stream);
         }
         else
+#endif
         {
             if(mtile_size == 128)
                 batched_forward_dispatch<InOutDataType,

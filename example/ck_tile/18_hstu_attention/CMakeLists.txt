@@ -6,10 +6,24 @@ list(APPEND EXAMPLE_HSTU_ATTENTION_COMPILE_OPTIONS -Wno-undefined-func-template 
 if(GPU_TARGETS MATCHES "gfx95" AND NOT GPU_TARGETS MATCHES "gfx94" AND NOT GPU_TARGETS MATCHES "gfx90")
     ## disable slp-vectorize improve pipelines performance on gfx950
     list(APPEND EXAMPLE_HSTU_ATTENTION_COMPILE_OPTIONS -DBUILD_HSTU_FOR_GFX95 -fno-slp-vectorize)
+    set(_HSTU_FWD_SPLITKV_DEFAULT ON)
 elseif(GPU_TARGETS MATCHES "gfx125" AND NOT GPU_TARGETS MATCHES "gfx94" AND NOT GPU_TARGETS MATCHES "gfx90")
     list(APPEND EXAMPLE_HSTU_ATTENTION_COMPILE_OPTIONS -DBUILD_HSTU_FOR_GFX125)
+    set(_HSTU_FWD_SPLITKV_DEFAULT OFF)
 else()
     list(APPEND EXAMPLE_HSTU_ATTENTION_COMPILE_OPTIONS -DBUILD_HSTU_FOR_GFX94)
+    set(_HSTU_FWD_SPLITKV_DEFAULT ON)
+endif()
+
+# Forward split-KV path. Split-KV is a scheduling choice, not a feature: it produces the
+# same results as the plain path, so compiling it out changes which kernel runs, never the
+# numbers. On gfx1250 it measured slower than the plain path for the TDM forward pipeline,
+# so it defaults to OFF there. Note this switches off compilation, not just dispatch: the
+# macro reaches the sources so that *_forward_splitkv_dispatch is never instantiated.
+option(HSTU_FWD_ENABLE_SPLITKV "Compile the forward split-KV path" ${_HSTU_FWD_SPLITKV_DEFAULT})
+if(NOT HSTU_FWD_ENABLE_SPLITKV)
+    list(APPEND EXAMPLE_HSTU_ATTENTION_COMPILE_OPTIONS -DHSTU_FWD_DISABLE_SPLITKV)
+    message(STATUS "HSTU_FWD_ENABLE_SPLITKV=OFF: forward split-KV path is not compiled")
 endif()
 
 # Fast-iteration build for the forward path.
