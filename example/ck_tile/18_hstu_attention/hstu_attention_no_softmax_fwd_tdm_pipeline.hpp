@@ -332,100 +332,48 @@ struct HstuAttentionNoSoftmaxFwdPipelineQRKSVSTdm
 
         auto seqlen_k_curr = seqlen_k_start;
 
-        // Running K one stage ahead (issued during the previous iteration's gemm_1) only
-        // pays off without a causal mask. Measured on gfx1250, b=512/64, hdim 128: the
-        // K prefetch gains 7.9% (seqlen 128) / 10.7% (seqlen 1024) without a mask but
-        // costs 4.9% / 7.6% with one, so it is gated on the mask mode. The V prefetch
-        // below is unconditional -- it wins in every measured configuration.
-        constexpr bool kPrefetchK = !kHasCausal;
-
         // With n0_loops == k1_loops == 1 (hdim 128) K only ever lands in buffer 0 and V in
         // buffer 2, leaving buffers 1 and 3 unused. Ping-pong across kv-tiles instead: issue
         // K[t+1] and V[t+1] into the spare half right after the single barrier of iteration
         // t, so both descriptors stay in flight for the whole iteration. Measured on a
         // standalone TDM micro-benchmark, going from 1 to 2 outstanding descriptors nearly
         // doubles the raw transfer rate (+79% cache-resident / +99% DRAM-bound).
-        constexpr bool kDeepPipeline = (n0_loops == 1 && NumKVLdsBuffers >= 4);
+        //
+        // This is the only schedule this pipeline implements, so assert the preconditions
+        // instead of silently falling back to an untested one.
+        static_assert(n0_loops == 1 && NumKVLdsBuffers >= 4,
+                      "hstu no-softmax tdm pipeline only implements the deep (ping-pong) "
+                      "schedule, which needs a single n0 sub-loop and a spare half of the "
+                      "K/V LDS buffers");
 
-        [[maybe_unused]] auto k_lds_cur  = k_lds_windows[number<0>{}];
-        [[maybe_unused]] auto k_lds_next = k_lds_windows[number<1 % NumKVLdsBuffers>{}];
-        [[maybe_unused]] auto v_lds_cur  = v_lds_windows[number<2 % NumKVLdsBuffers>{}];
-        [[maybe_unused]] auto v_lds_next = v_lds_windows[number<3 % NumKVLdsBuffers>{}];
+        auto k_lds_cur  = k_lds_windows[number<0>{}];
+        auto k_lds_next = k_lds_windows[number<1 % NumKVLdsBuffers>{}];
+        auto v_lds_cur  = v_lds_windows[number<2 % NumKVLdsBuffers>{}];
+        auto v_lds_next = v_lds_windows[number<3 % NumKVLdsBuffers>{}];
 
-        if constexpr(kDeepPipeline)
-        {
-            load_tile_tdm(tdm_config_kv, k_lds_cur, k_dram_window);
-            move_tile_window(k_dram_window, {kN0Sub, 0});
-            load_tile_tdm(tdm_config_kv, v_lds_cur, v_dram_window);
-            move_tile_window(v_dram_window, {kK1, 0});
-        }
-        else if constexpr(kPrefetchK)
-        {
-            load_tile_tdm(tdm_config_kv, k_lds_windows[number<0>{}], k_dram_window);
-            move_tile_window(k_dram_window, {kN0Sub, 0});
-        }
+        load_tile_tdm(tdm_config_kv, k_lds_cur, k_dram_window);
+        move_tile_window(k_dram_window, {kN0Sub, 0});
+        load_tile_tdm(tdm_config_kv, v_lds_cur, v_dram_window);
+        move_tile_window(v_dram_window, {kK1, 0});
 
         do
         {
             // STAGE 1, Gemm_0 ( S = Q@K )
             static_for<0, n0_loops, 1>{}([&](auto i_n0) {
-                if constexpr(kDeepPipeline)
-                {
-                    // K[t]/V[t] were issued one kv-tile ago. This is the only barrier of the
-                    // iteration: it retires them (RAW for both gemms) and, because every
-                    // reader of the spare half is a gemm of iteration t-1, it doubles as the
-                    // WAR fence for the K[t+1]/V[t+1] writes issued right below.
-                    s_wait_tensorcnt_barrier<0>();
+                // K[t]/V[t] were issued one kv-tile ago. This is the only barrier of the
+                // iteration: it retires them (RAW for both gemms) and, because every
+                // reader of the spare half is a gemm of iteration t-1, it doubles as the
+                // WAR fence for the K[t+1]/V[t+1] writes issued right below.
+                s_wait_tensorcnt_barrier<0>();
 
-                    load_tile_tdm(tdm_config_kv, k_lds_next, k_dram_window);
-                    move_tile_window(k_dram_window, {kN0Sub, 0});
-                    load_tile_tdm(tdm_config_kv, v_lds_next, v_dram_window);
-                    move_tile_window(v_dram_window, {kK1, 0});
-
-                    __builtin_amdgcn_sched_barrier(0x00000001);
-
-                    gemm_0(sacc_tile, q_tile, k_lds_cur);
-                }
-                else
-                {
-                // K goes global -> LDS through the TDM engine, no register staging.
-                if constexpr(!kPrefetchK)
-                {
-                    load_tile_tdm(tdm_config_kv,
-                                  k_lds_windows[number<i_n0 % NumKVLdsBuffers>{}],
-                                  k_dram_window);
-                    move_tile_window(k_dram_window, {kN0Sub, 0});
-
-                    __builtin_amdgcn_sched_barrier(0x00000001);
-                }
-
-                // TDM writes are tracked by tensorcnt, not vmcnt. When K is prefetched,
-                // the only descriptors still in flight ahead of K[i_n0] are the i_n0 V
-                // transfers issued below, and TDM retires them in order within a wave.
-                s_wait_tensorcnt_barrier<kPrefetchK ? index_t{i_n0} : 0>();
-
-                if constexpr(kPrefetchK && i_n0 + 1 < n0_loops)
-                {
-                    load_tile_tdm(tdm_config_kv,
-                                  k_lds_windows[number<(i_n0 + 1) % NumKVLdsBuffers>{}],
-                                  k_dram_window);
-                    move_tile_window(k_dram_window, {kN0Sub, 0});
-                }
-
-                // Issue the matching V DMA right here instead of in STAGE 3: its LDS
-                // buffer ((i+2)%4) is disjoint from the K buffers, and the barrier just
-                // above is the WAR fence against the previous iteration's gemm_1 reads.
-                // The transfer then overlaps gemm_0 + the whole of STAGE 2.
-                load_tile_tdm(tdm_config_kv,
-                              v_lds_windows[number<(i_n0 + 2) % NumKVLdsBuffers>{}],
-                              v_dram_window);
+                load_tile_tdm(tdm_config_kv, k_lds_next, k_dram_window);
+                move_tile_window(k_dram_window, {kN0Sub, 0});
+                load_tile_tdm(tdm_config_kv, v_lds_next, v_dram_window);
                 move_tile_window(v_dram_window, {kK1, 0});
 
                 __builtin_amdgcn_sched_barrier(0x00000001);
 
-                // execute current unroll of gemm_0
-                gemm_0(sacc_tile, q_tile, k_lds_windows[number<i_n0 % NumKVLdsBuffers>{}]);
-                }
+                gemm_0(sacc_tile, q_tile, k_lds_cur);
 
                 auto tmp_tile = cast_tile<CompDataType>(sacc_tile);
 
@@ -512,53 +460,23 @@ struct HstuAttentionNoSoftmaxFwdPipelineQRKSVSTdm
 
             // STAGE 3, Gemm_1 ( O = P@V )
             static_for<0, k1_loops, 1>{}([&](auto i_k1) {
-                if constexpr(kDeepPipeline)
-                {
-                    // V[t] was already retired by the single barrier in STAGE 1, and the
-                    // in-flight K[t+1]/V[t+1] target the other half of the buffers, so
-                    // gemm_1 needs neither a wait nor a barrier of its own.
-                    gemm_1(o_acc,
-                           get_slice_tile(
-                               p, sequence<0, i_k1 * kK1>{}, sequence<kM0, (i_k1 + 1) * kK1>{}),
-                           v_lds_cur);
-                }
-                else
-                {
-                // The V DMAs were all issued back in STAGE 1, in ascending i_k1 order.
-                // TDM descriptors retire in order within a wave, so V[i_k1] is done once
-                // at most the (k1_loops-1-i_k1) later ones are still outstanding.
-                s_wait_tensorcnt_barrier<k1_loops - 1 - i_k1>();
-
-                // On the last unroll, prefetch K[0] of the next kv-tile so that its
-                // transfer overlaps this gemm_1. Issuing it behind the barrier above --
-                // rather than adding a barrier of its own -- is what makes that barrier
-                // double as the WAR fence against gemm_0's reads of the same LDS buffer.
-                if constexpr(kPrefetchK && i_k1 + 1 == k1_loops)
-                {
-                    load_tile_tdm(tdm_config_kv, k_lds_windows[number<0>{}], k_dram_window);
-                    move_tile_window(k_dram_window, {kN0Sub, 0});
-                }
-
-                __builtin_amdgcn_sched_barrier(0x00000001);
-
-                gemm_1(
-                    o_acc,
-                    get_slice_tile(p, sequence<0, i_k1 * kK1>{}, sequence<kM0, (i_k1 + 1) * kK1>{}),
-                    v_lds_windows[number<(i_k1 + 2) % NumKVLdsBuffers>{}]);
-                }
+                // V[t] was already retired by the single barrier in STAGE 1, and the
+                // in-flight K[t+1]/V[t+1] target the other half of the buffers, so
+                // gemm_1 needs neither a wait nor a barrier of its own.
+                gemm_1(o_acc,
+                       get_slice_tile(
+                           p, sequence<0, i_k1 * kK1>{}, sequence<kM0, (i_k1 + 1) * kK1>{}),
+                       v_lds_cur);
             });
 
-            if constexpr(kDeepPipeline)
-            {
-                // swap the halves: what was just consumed becomes the DMA target next round
-                auto k_lds_tmp = k_lds_cur;
-                k_lds_cur      = k_lds_next;
-                k_lds_next     = k_lds_tmp;
+            // swap the halves: what was just consumed becomes the DMA target next round
+            auto k_lds_tmp = k_lds_cur;
+            k_lds_cur      = k_lds_next;
+            k_lds_next     = k_lds_tmp;
 
-                auto v_lds_tmp = v_lds_cur;
-                v_lds_cur      = v_lds_next;
-                v_lds_next     = v_lds_tmp;
-            }
+            auto v_lds_tmp = v_lds_cur;
+            v_lds_cur      = v_lds_next;
+            v_lds_next     = v_lds_tmp;
         } while(seqlen_k_curr < seqlen_k_end);
 
         return o_acc;
