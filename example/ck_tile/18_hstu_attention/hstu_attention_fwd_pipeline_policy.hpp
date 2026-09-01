@@ -156,21 +156,30 @@ struct HstuAttentionFwdPipelineQRKSVSPolicy
     // Note: tensor-dma.md:172 summarises pad_amount without the "+1"; the "+1" is the one
     // spelled out in gemm_universal_pipeline_ag_bg_cr_policy.hpp:1185-1186.
     // Set kTdmLdsPadEnable=false to fall back to the un-padded plain layout.
-    static constexpr bool kTdmLdsPadEnable   = true;
-    static constexpr index_t kTdmLdsPadBytes = 32; // padding inserted per LDS row
+    static constexpr bool kTdmLdsPadEnable = true;
+    // padding inserted per LDS row, K and V separately: a row set spreads over all 64 LDS
+    // banks exactly when the pad equals the per-lane access width of that side's reader.
+    // gemm_0 reads K with plain ds_load_b128 -> 16 B per lane over 16 rows; gemm_1 reads V
+    // with ds_load_tr16_b128 -> 32 B per lane over 8 rows. Matches the two branches of
+    // gemm_universal_pipeline_ag_bg_cr_policy.hpp:1184-1188 (non-tr) / :1160-1170 (tr).
+    static constexpr index_t kTdmLdsPadBytesK = 16;
+    static constexpr index_t kTdmLdsPadBytesV = 32;
 
-    // D#.pad_amount field value
-    static constexpr index_t kTdmLdsPadAmount = kTdmLdsPadBytes / 4 - 1;
+    // D#.pad_amount field values
+    static constexpr index_t kTdmLdsPadAmountK = kTdmLdsPadBytesK / 4 - 1;
+    static constexpr index_t kTdmLdsPadAmountV = kTdmLdsPadBytesV / 4 - 1;
 
-    static_assert((kTdmLdsPadAmount + 1) * 4 == kTdmLdsPadBytes,
-                  "TDM pad_amount does not round-trip: kTdmLdsPadBytes must be a multiple of "
-                  "4 B (one DWORD)");
-    static_assert(kTdmLdsPadAmount <= 127, "TDM pad_amount field (7 bit) overflows");
-    // Lower bound, two distinct traps: kTdmLdsPadBytes == 0 yields a field value of -1,
-    // which the 7 bit D# field would silently reinterpret; and kTdmLdsPadBytes == 4 yields
+    static_assert((kTdmLdsPadAmountK + 1) * 4 == kTdmLdsPadBytesK &&
+                      (kTdmLdsPadAmountV + 1) * 4 == kTdmLdsPadBytesV,
+                  "TDM pad_amount does not round-trip: kTdmLdsPadBytesK/V must be a multiple "
+                  "of 4 B (one DWORD)");
+    static_assert(kTdmLdsPadAmountK <= 127 && kTdmLdsPadAmountV <= 127,
+                  "TDM pad_amount field (7 bit) overflows");
+    // Lower bound, two distinct traps: kTdmLdsPadBytesK/V == 0 yields a field value of -1,
+    // which the 7 bit D# field would silently reinterpret; and kTdmLdsPadBytesK/V == 4 yields
     // a field value of 0 while pad_interval stays non-zero, which tensor-dma.md:323,581-583
     // calls out as producing unpredictable results.
-    static_assert(kTdmLdsPadAmount >= 1,
+    static_assert(kTdmLdsPadAmountK >= 1 && kTdmLdsPadAmountV >= 1,
                   "TDM pad_amount field must be positive while pad_interval is non-zero; set "
                   "kTdmLdsPadEnable=false to disable padding instead");
     // Every padded LDS row must stay 16 B aligned. The plain LDS descriptors declare a
@@ -178,22 +187,40 @@ struct HstuAttentionFwdPipelineQRKSVSPolicy
     // the pad is what lengthens the row stride, so a finer-grained pad would silently
     // invalidate that declaration from the second row on. The hardware itself only asks
     // for DWORD granularity (tensor-dma.md:172), which is why this has to be checked here.
-    static_assert(kTdmLdsPadBytes % 16 == 0,
+    static_assert(kTdmLdsPadBytesK % 16 == 0 && kTdmLdsPadBytesV % 16 == 0,
                   "TDM LDS padding must be a multiple of 16 B to keep every padded LDS row "
                   "16 B aligned for the vectorised LDS readers");
 
-    // padding inserted per LDS row, in elements
+    // padding inserted per K LDS row, in elements
     template <typename Problem>
-    CK_TILE_HOST_DEVICE static constexpr index_t GetPlainLdsPadElements()
+    CK_TILE_HOST_DEVICE static constexpr index_t GetPlainLdsPadElementsK()
     {
         constexpr index_t kQKHeaddim = Problem::HstuAttentionTileSetting::kQKHeaddim;
         constexpr index_t kN1        = Problem::HstuAttentionTileSetting::kN1;
 
-        // one pad_interval must describe both the K row (kQKHeaddim) and the V row (kN1),
-        // because a single TDM descriptor config drives both loads
+        // K and V carry their own pad_amount but share one pad_interval (derived from the
+        // K row below), so padding is only enabled when their row lengths match
         if constexpr(kTdmLdsPadEnable && kQKHeaddim == kN1)
         {
-            return kTdmLdsPadBytes / static_cast<index_t>(sizeof(typename Problem::QKVDataType));
+            return kTdmLdsPadBytesK / static_cast<index_t>(sizeof(typename Problem::QKVDataType));
+        }
+        else
+        {
+            return 0;
+        }
+    }
+
+    // padding inserted per V LDS row, in elements
+    template <typename Problem>
+    CK_TILE_HOST_DEVICE static constexpr index_t GetPlainLdsPadElementsV()
+    {
+        constexpr index_t kQKHeaddim = Problem::HstuAttentionTileSetting::kQKHeaddim;
+        constexpr index_t kN1        = Problem::HstuAttentionTileSetting::kN1;
+
+        // see GetPlainLdsPadElementsK for the kQKHeaddim == kN1 condition
+        if constexpr(kTdmLdsPadEnable && kQKHeaddim == kN1)
+        {
+            return kTdmLdsPadBytesV / static_cast<index_t>(sizeof(typename Problem::QKVDataType));
         }
         else
         {
@@ -248,7 +275,7 @@ struct HstuAttentionFwdPipelineQRKSVSPolicy
 
         if constexpr(kPlainLds)
         {
-            return kNPerBlock * (kKPerBlock + GetPlainLdsPadElements<Problem>());
+            return kNPerBlock * (kKPerBlock + GetPlainLdsPadElementsK<Problem>());
         }
         // for hdim96 and hdim160
         else if constexpr(!detail::IsPerfectHeaddimSize(kKPerBlock))
@@ -278,7 +305,7 @@ struct HstuAttentionFwdPipelineQRKSVSPolicy
         if constexpr(kPlainLds)
         {
             // plain V layout is [kK1 rows, kN1 elements/row]; padding lengthens the row
-            return kKPerBlock * (kNPerBlock + GetPlainLdsPadElements<Problem>());
+            return kKPerBlock * (kNPerBlock + GetPlainLdsPadElementsV<Problem>());
         }
         else if constexpr(!kUseTrLoad)
         {
@@ -324,7 +351,7 @@ struct HstuAttentionFwdPipelineQRKSVSPolicy
         {
             // kPlainLds: rows are lengthened by the TDM hardware padding so that the row
             // stride is no longer a multiple of the 256 B LDS bank wrap-around
-            constexpr index_t KPadElems = kPlainLds ? GetPlainLdsPadElements<Problem>() : 0;
+            constexpr index_t KPadElems = kPlainLds ? GetPlainLdsPadElementsK<Problem>() : 0;
             constexpr index_t KRowStride = kKPerBlock + KPadElems;
 
             constexpr index_t KSingleSmemElementSpaceSize = kNPerBlock * KRowStride;
@@ -603,7 +630,7 @@ struct HstuAttentionFwdPipelineQRKSVSPolicy
                 // Plain row-major [NumBuf, kK1, kN1] -> merged 2D, no swizzle, so the TDM
                 // writer and the ds_load_tr reader agree on the layout. With
                 // kTdmLdsPadEnable the row stride carries the TDM hardware padding.
-                constexpr index_t VPadElems  = GetPlainLdsPadElements<Problem>();
+                constexpr index_t VPadElems  = GetPlainLdsPadElementsV<Problem>();
                 constexpr index_t VRowStride = kNPerBlock + VPadElems;
 
                 static_assert(kKPerBlock * VRowStride ==

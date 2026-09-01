@@ -221,17 +221,28 @@ struct HstuAttentionNoSoftmaxFwdPipelineQRKSVSTdm
                              Policy::template MakeKDramTileDistribution<Problem,
                                                                         kTrivialTileMajorDram>());
 
-        // TDM descriptor config for the K/V global->LDS DMA. The hardware LDS padding is
+        // TDM descriptor configs for the K/V global->LDS DMA. The hardware LDS padding is
         // enabled so that the plain row-major LDS row stride stops being a multiple of the
         // 256 B LDS bank wrap-around; the reader-side descriptors carry the very same
-        // padded stride (Policy::GetPlainLdsPadElements). K and V share one config, which
-        // is why the padding is only enabled when their row lengths match.
-        TDMConfig tdm_config_kv{};
-        if constexpr(Policy::template GetPlainLdsPadElements<Problem>() != 0)
+        // padded stride (Policy::GetPlainLdsPadElementsK/V). K and V need different
+        // pad_amounts because their LDS readers have different per-lane access widths, but
+        // they share pad_interval, which is why padding is only enabled when their row
+        // lengths match.
+        TDMConfig tdm_config_k{};
+        if constexpr(Policy::template GetPlainLdsPadElementsK<Problem>() != 0)
         {
-            tdm_config_kv.pad_enable            = true;
-            tdm_config_kv.pad_config.pad_amount = Policy::kTdmLdsPadAmount;
-            tdm_config_kv.pad_config.pad_interval =
+            tdm_config_k.pad_enable            = true;
+            tdm_config_k.pad_config.pad_amount = Policy::kTdmLdsPadAmountK;
+            tdm_config_k.pad_config.pad_interval =
+                Policy::template GetPlainLdsPadInterval<Problem>();
+        }
+
+        TDMConfig tdm_config_v{};
+        if constexpr(Policy::template GetPlainLdsPadElementsV<Problem>() != 0)
+        {
+            tdm_config_v.pad_enable            = true;
+            tdm_config_v.pad_config.pad_amount = Policy::kTdmLdsPadAmountV;
+            tdm_config_v.pad_config.pad_interval =
                 Policy::template GetPlainLdsPadInterval<Problem>();
         }
 
@@ -351,9 +362,9 @@ struct HstuAttentionNoSoftmaxFwdPipelineQRKSVSTdm
         auto v_lds_cur  = v_lds_windows[number<2 % NumKVLdsBuffers>{}];
         auto v_lds_next = v_lds_windows[number<3 % NumKVLdsBuffers>{}];
 
-        load_tile_tdm(tdm_config_kv, k_lds_cur, k_dram_window);
+        load_tile_tdm(tdm_config_k, k_lds_cur, k_dram_window);
         move_tile_window(k_dram_window, {kN0Sub, 0});
-        load_tile_tdm(tdm_config_kv, v_lds_cur, v_dram_window);
+        load_tile_tdm(tdm_config_v, v_lds_cur, v_dram_window);
         move_tile_window(v_dram_window, {kK1, 0});
 
         do
@@ -366,9 +377,9 @@ struct HstuAttentionNoSoftmaxFwdPipelineQRKSVSTdm
                 // WAR fence for the K[t+1]/V[t+1] writes issued right below.
                 s_wait_tensorcnt_barrier<0>();
 
-                load_tile_tdm(tdm_config_kv, k_lds_next, k_dram_window);
+                load_tile_tdm(tdm_config_k, k_lds_next, k_dram_window);
                 move_tile_window(k_dram_window, {kN0Sub, 0});
-                load_tile_tdm(tdm_config_kv, v_lds_next, v_dram_window);
+                load_tile_tdm(tdm_config_v, v_lds_next, v_dram_window);
                 move_tile_window(v_dram_window, {kK1, 0});
 
                 __builtin_amdgcn_sched_barrier(0x00000001);
