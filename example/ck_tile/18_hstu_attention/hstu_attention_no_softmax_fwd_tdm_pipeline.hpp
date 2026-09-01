@@ -63,16 +63,13 @@ struct HstuAttentionNoSoftmaxFwdPipelineQRKSVSTdm
     // own one contiguous (MN/warpNum x K) rectangle.
     static constexpr bool kTrivialTileMajorDram = true;
 
-    // Guard-rails matching the dispatch gating. If codegen/dispatch ever drifts, this
-    // fails to compile instead of silently taking a wrong path.
-    static_assert(!kHasDropout, "hstu no-softmax tdm pipeline does not support dropout yet");
-
     static constexpr bool kPadSeqLenQ   = Traits::kPadSeqLenQ;
     static constexpr bool kPadSeqLenK   = Traits::kPadSeqLenK;
     static constexpr bool kPadHeadDimQK = Traits::kPadHeadDimQK;
     static constexpr bool kPadHeadDimV  = Traits::kPadHeadDimV;
 
-    // More guard-rails matching the dispatch gating (see the kHasDropout one above).
+    // Guard-rails matching the dispatch gating. If codegen/dispatch ever drifts, these
+    // fail to compile instead of silently taking a wrong path.
     static_assert(kQKHeaddim == 128,
                   "hstu no-softmax tdm pipeline is only gated in for MaxK == 128; other tile "
                   "settings break the kN0 == kN0Sub == kK1 == 32 assumption baked into it");

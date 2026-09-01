@@ -23,7 +23,7 @@ enum class HstuFwdPipelineKind
 // pick up part of the gating and silently miss the rest.
 //
 // The gfx1250 TDM pipeline is preferred over trload where it applies. Everything it does
-// not cover falls back to trload: softmax, dropout, MaxK != 128, and padded head dims.
+// not cover falls back to trload: softmax, MaxK != 128, and padded head dims.
 // Head-dim padding is excluded because TDM clamps out-of-bound reads against the tensor
 // view lengths, and the HSTU kernel wraps K/V in a pad_tensor_view whose lengths are
 // already rounded up to a full tile - so the clamp lets the DMA walk past the end of the
@@ -38,7 +38,7 @@ template <bool kUseSoftmax,
 constexpr HstuFwdPipelineKind get_hstu_fwd_pipeline_kind()
 {
 #if defined(BUILD_HSTU_FOR_GFX125)
-    if constexpr(!kUseSoftmax && !kHasDropout && MaxK == 128 && !kPadHeadDimQK && !kPadHeadDimV)
+    if constexpr(!kUseSoftmax && MaxK == 128 && !kPadHeadDimQK && !kPadHeadDimV)
         return HstuFwdPipelineKind::Tdm;
     else
         return HstuFwdPipelineKind::TrLoad;
