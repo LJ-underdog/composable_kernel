@@ -147,13 +147,40 @@ struct HstuAttentionFwdPipelineQRKSVSPolicy
     }
 
     // ---- TDM hardware LDS padding (plain-LDS / TDM pipeline only) -------------------
-    // D#.pad_amount field value P: hardware inserts (P + 1) DWORDs of padding after every
-    // pad_interval DWORDs of source data. Encoding of both fields follows
-    // gemm_universal_pipeline_ag_bg_cr_policy.hpp:1160-1170 / :1221-1226 (the gfx1250 gemm
-    // tr-load path) and rocm-ref/topics/tensor-dma.md:169-172,313-323.
+    // The knob below is the *physical* padding in bytes; the D# field values are derived
+    // from it and round-trip checked, so nothing here is a raw hardware magic number.
+    //   D#.pad_amount   field P -> hardware inserts (P + 1) DWORDs of padding
+    //   D#.pad_interval field N -> ... after every 2^(N+1) DWORDs of source data
+    // Encoding follows gemm_universal_pipeline_ag_bg_cr_policy.hpp:1160-1170 / :1180-1188
+    // (the gfx1250 gemm tr-load path) and rocm-ref/topics/tensor-dma.md:169-172,313-323.
+    // Note: tensor-dma.md:172 summarises pad_amount without the "+1"; the "+1" is the one
+    // spelled out in gemm_universal_pipeline_ag_bg_cr_policy.hpp:1185-1186.
     // Set kTdmLdsPadEnable=false to fall back to the un-padded plain layout.
-    static constexpr bool kTdmLdsPadEnable    = true;
-    static constexpr index_t kTdmLdsPadAmount = 7; // (7+1) DWORDs = 32 B per LDS row
+    static constexpr bool kTdmLdsPadEnable   = true;
+    static constexpr index_t kTdmLdsPadBytes = 32; // padding inserted per LDS row
+
+    // D#.pad_amount field value
+    static constexpr index_t kTdmLdsPadAmount = kTdmLdsPadBytes / 4 - 1;
+
+    static_assert((kTdmLdsPadAmount + 1) * 4 == kTdmLdsPadBytes,
+                  "TDM pad_amount does not round-trip: kTdmLdsPadBytes must be a multiple of "
+                  "4 B (one DWORD)");
+    static_assert(kTdmLdsPadAmount <= 127, "TDM pad_amount field (7 bit) overflows");
+    // Lower bound, two distinct traps: kTdmLdsPadBytes == 0 yields a field value of -1,
+    // which the 7 bit D# field would silently reinterpret; and kTdmLdsPadBytes == 4 yields
+    // a field value of 0 while pad_interval stays non-zero, which tensor-dma.md:323,581-583
+    // calls out as producing unpredictable results.
+    static_assert(kTdmLdsPadAmount >= 1,
+                  "TDM pad_amount field must be positive while pad_interval is non-zero; set "
+                  "kTdmLdsPadEnable=false to disable padding instead");
+    // Every padded LDS row must stay 16 B aligned. The plain LDS descriptors declare a
+    // vectorised last dim (K: kKVector, V: kKPack -- both 16 B wide for bf16/fp16), and
+    // the pad is what lengthens the row stride, so a finer-grained pad would silently
+    // invalidate that declaration from the second row on. The hardware itself only asks
+    // for DWORD granularity (tensor-dma.md:172), which is why this has to be checked here.
+    static_assert(kTdmLdsPadBytes % 16 == 0,
+                  "TDM LDS padding must be a multiple of 16 B to keep every padded LDS row "
+                  "16 B aligned for the vectorised LDS readers");
 
     // padding inserted per LDS row, in elements
     template <typename Problem>
@@ -166,8 +193,7 @@ struct HstuAttentionFwdPipelineQRKSVSPolicy
         // because a single TDM descriptor config drives both loads
         if constexpr(kTdmLdsPadEnable && kQKHeaddim == kN1)
         {
-            return (kTdmLdsPadAmount + 1) * static_cast<index_t>(sizeof(int32_t)) /
-                   static_cast<index_t>(sizeof(typename Problem::QKVDataType));
+            return kTdmLdsPadBytes / static_cast<index_t>(sizeof(typename Problem::QKVDataType));
         }
         else
         {
@@ -179,18 +205,37 @@ struct HstuAttentionFwdPipelineQRKSVSPolicy
     template <typename Problem>
     CK_TILE_HOST_DEVICE static constexpr index_t GetPlainLdsPadInterval()
     {
-        constexpr index_t row_dwords = Problem::HstuAttentionTileSetting::kQKHeaddim *
-                                       static_cast<index_t>(sizeof(typename Problem::QKVDataType)) /
-                                       static_cast<index_t>(sizeof(int32_t));
+        // the physical interval is one plain-LDS row of source data
+        constexpr index_t kIntervalBytes =
+            Problem::HstuAttentionTileSetting::kQKHeaddim *
+            static_cast<index_t>(sizeof(typename Problem::QKVDataType));
 
-        index_t n = 0;
-        index_t x = row_dwords;
-        while(x > 1)
-        {
-            x >>= 1;
-            n++;
-        }
-        return n - 1;
+        auto constexpr_log2_floor = [](index_t x) constexpr {
+            index_t n = 0;
+            while(x > 1)
+            {
+                x >>= 1;
+                n++;
+            }
+            return n;
+        };
+
+        constexpr index_t n =
+            constexpr_log2_floor(kIntervalBytes / static_cast<index_t>(sizeof(int32_t))) - 1;
+
+        static_assert((index_t{1} << (n + 1)) * 4 == kIntervalBytes,
+                      "TDM pad_interval does not round-trip: one LDS row must be a "
+                      "power-of-two number of DWORDs, otherwise the hardware pads at a "
+                      "different stride than the reader-side descriptors assume");
+        static_assert(n <= 7, "TDM pad_interval field (3 bit) overflows");
+        // tensor-dma.md:357: TDM only emits the L0-bypassing "direct copy" path when
+        // pad_interval is >= 128 B and 128 B granular; violating it compiles and computes
+        // correctly but silently loses the fast path.
+        static_assert(kIntervalBytes >= 128 && kIntervalBytes % 128 == 0,
+                      "TDM pad_interval must be >= 128 B and 128 B granular, otherwise the "
+                      "direct-copy path is silently disabled");
+
+        return n;
     }
 
     template <typename Problem, bool kPlainLds = false>
