@@ -105,7 +105,8 @@ struct HstuAttentionWithSoftmaxFwdBlockTile<128, 64>
 template <>
 struct HstuAttentionWithSoftmaxFwdBlockTile<128, 128>
 {
-    using type        = ck_tile::sequence<128, 64, 32, 128, 16, 128>;
+    // kK1 follows the gemm1 warp-tile K (now 16x16x32), as every other gfx125 entry does.
+    using type        = ck_tile::sequence<128, 64, 32, 128, 32, 128>;
     using gemm0_warps = ck_tile::sequence<4, 1, 1>;
     using gemm1_warps = ck_tile::sequence<4, 1, 1>;
 };
@@ -224,9 +225,9 @@ struct HstuAttentionWithSoftmaxFwdTileSetting<96, MTile>
     using Type = ck_tile::HstuAttentionFwdTileSettingClass<
         typename HstuAttentionWithSoftmaxFwdBlockTile<96>::type,
         typename HstuAttentionWithSoftmaxFwdBlockTile<96>::gemm0_warps,
-        WarpTile_32x32x16,
+        WarpTile_16x16x32,
         typename HstuAttentionWithSoftmaxFwdBlockTile<96>::gemm1_warps,
-        WarpTile_32x32x16>;
+        WarpTile_16x16x32>;
 };
 
 template struct HstuAttentionWithSoftmaxFwdTileSetting<96, 64>;
@@ -249,9 +250,9 @@ struct HstuAttentionWithSoftmaxFwdTileSetting<128, 128>
     using Type = ck_tile::HstuAttentionFwdTileSettingClass<
         typename HstuAttentionWithSoftmaxFwdBlockTile<128, 128>::type,
         typename HstuAttentionWithSoftmaxFwdBlockTile<128, 128>::gemm0_warps,
-        WarpTile_32x32x16,
+        WarpTile_16x16x32,
         typename HstuAttentionWithSoftmaxFwdBlockTile<128, 128>::gemm1_warps,
-        WarpTile_32x32x16>;
+        WarpTile_16x16x32>;
 };
 
 template <ck_tile::index_t MTile>
