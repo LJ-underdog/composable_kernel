@@ -23,6 +23,7 @@
 #include "hstu_attention_with_softmax_fwd_trload_pipeline.hpp"
 #include "hstu_attention_no_softmax_fwd_trload_pipeline.hpp"
 #include "hstu_attention_no_softmax_fwd_tdm_pipeline.hpp"
+#include "hstu_attention_with_softmax_fwd_tdm_pipeline.hpp"
 #include "hstu_attention_no_softmax_fwd_splitkv_combine_pipeline.hpp"
 #include "hstu_attention_with_softmax_fwd_splitkv_combine_pipeline.hpp"
 #include "hstu_attention_fwd_splitkv_kernel.hpp"
@@ -115,14 +116,19 @@ struct jagged_forward_splitkv_dispatch
                                                                              kHasDropout,
                                                                              kPadHeadDimQK,
                                                                              kPadHeadDimV,
-                                                                             MaxK>();
+                                                                             MaxK,
+                                                                             MTile>();
 
                     if constexpr(kPipelineKind == HstuFwdPipelineKind::Tdm)
                     {
-                        // gating guarantees kUseSoftmax == false here
-                        using HstuPipeline =
-                            ck_tile::HstuAttentionNoSoftmaxFwdPipelineQRKSVSTdm<HstuPipelineProblem,
-                                                                                HstuTraits>;
+                        using HstuPipeline = std::conditional_t<
+                            kUseSoftmax,
+                            ck_tile::HstuAttentionWithSoftmaxFwdPipelineQRKSVSTdm<
+                                HstuPipelineProblem,
+                                HstuTraits>,
+                            ck_tile::HstuAttentionNoSoftmaxFwdPipelineQRKSVSTdm<
+                                HstuPipelineProblem,
+                                HstuTraits>>;
 
                         using HstuKernel =
                             ck_tile::HstuAttentionFwdSplitKVKernel<HstuPipeline, HstuEpilogue>;

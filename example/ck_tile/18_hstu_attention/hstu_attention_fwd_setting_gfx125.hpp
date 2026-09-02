@@ -97,7 +97,8 @@ struct HstuAttentionWithSoftmaxFwdBlockTile<96, MTile>
 template <>
 struct HstuAttentionWithSoftmaxFwdBlockTile<128, 64>
 {
-    using type        = ck_tile::sequence<64, 64, 32, 128, 32, 128>;
+    // TDM (deep ping-pong) needs n0_loops == k1_loops == 1, i.e. kN0 == kN0Sub == kK1.
+    using type        = ck_tile::sequence<64, 32, 32, 128, 32, 128>;
     using gemm0_warps = ck_tile::sequence<4, 1, 1>;
     using gemm1_warps = ck_tile::sequence<4, 1, 1>;
 };
