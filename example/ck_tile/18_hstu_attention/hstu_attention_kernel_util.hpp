@@ -28,6 +28,25 @@ struct has_use_trload_flag<
 template <typename T>
 static inline constexpr bool is_using_trload_v = has_use_trload_flag<T>::value;
 
+// A helper struct for detecting kUseTdm. The tdm pipeline also sets kUseTrLoad, so
+// is_using_trload_v cannot tell it apart from the trload pipeline.
+// T is the pipeline class used by the kernel instance
+template <typename T, typename = void>
+struct has_use_tdm_flag : std::false_type
+{
+};
+
+template <typename T>
+struct has_use_tdm_flag<
+    T,
+    std::enable_if_t<std::is_convertible_v<decltype(T::kUseTdm), bool> && T::kUseTdm>>
+    : std::true_type
+{
+};
+
+template <typename T>
+static inline constexpr bool is_using_tdm_v = has_use_tdm_flag<T>::value;
+
 // scale is uniform (scalar register), c is per-lane (vector register)
 // GFX9 VOP2: V_MUL_F32 VDST, SRC0, SRC1 - SRC0 can be SGPR, SRC1 must be VGPR
 

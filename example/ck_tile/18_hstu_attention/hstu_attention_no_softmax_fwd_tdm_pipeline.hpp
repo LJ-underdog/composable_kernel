@@ -62,6 +62,11 @@ struct HstuAttentionNoSoftmaxFwdPipelineQRKSVSTdm
     // box_dim is reverse-derived from the dram window's ys_to_d lengths, so one wave must
     // own one contiguous (MN/warpNum x K) rectangle.
     static constexpr bool kTrivialTileMajorDram = true;
+    // Since kUseTrLoad is shared with the trload pipeline, the kernel needs a marker of
+    // its own to recognize this one: the K/V dram views must skip the head-dim pad here
+    // so the TDM box clamp sees the true head-dim (see the kernel). Q keeps its pad - it
+    // is read with a plain load_tile, which has no box clamp to zero-fill the tail.
+    static constexpr bool kUseTdm = true;
 
     static constexpr bool kPadSeqLenQ   = Traits::kPadSeqLenQ;
     static constexpr bool kPadSeqLenK   = Traits::kPadSeqLenK;
@@ -73,10 +78,6 @@ struct HstuAttentionNoSoftmaxFwdPipelineQRKSVSTdm
     static_assert(kQKHeaddim == 128,
                   "hstu no-softmax tdm pipeline is only gated in for MaxK == 128; other tile "
                   "settings break the kN0 == kN0Sub == kK1 == 32 assumption baked into it");
-    static_assert(!kPadHeadDimQK && !kPadHeadDimV,
-                  "hstu no-softmax tdm pipeline cannot run with a padded head dim: its "
-                  "out-of-bound clamping uses the pad_tensor_view lengths (rounded up to the "
-                  "tile), so it DMAs past the end of K/V and page-faults on the GPU");
 
     // last dimension vector length used to create tensor view(and decide buffer_load vector length)
     // ... together with tensor distribution. tensor dist should able to overwrite this
