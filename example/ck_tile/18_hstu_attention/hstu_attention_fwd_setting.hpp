@@ -23,7 +23,7 @@ enum class HstuFwdPipelineKind
 // pick up part of the gating and silently miss the rest.
 //
 // The gfx1250 TDM pipeline is preferred over trload where it applies. Everything it does
-// not cover falls back to trload: softmax at MTile == 128, and MaxK != 128.
+// not cover falls back to trload: MaxK != 128.
 //
 // Keep this gating in sync with the static_asserts inside the tdm pipeline.
 template <bool kUseSoftmax,
@@ -37,10 +37,10 @@ constexpr HstuFwdPipelineKind get_hstu_fwd_pipeline_kind()
 #if defined(BUILD_HSTU_FOR_GFX125)
     if constexpr(!kUseSoftmax && MaxK == 128)
         return HstuFwdPipelineKind::Tdm;
-    // The with-softmax TDM pipeline carries m/l plus the o_acc rescale in registers on top
-    // of the no-softmax one, so it is only gated in at MTile == 64 for now; MTile == 128
-    // has no VGPR headroom left and would drop to 2 waves/SIMD.
-    else if constexpr(kUseSoftmax && MaxK == 128 && MTile == 64)
+    // Both MTile sizes go through TDM, same as the no-softmax path above: the block tiles
+    // are field-for-field identical to their no-softmax counterparts, so the deep ping-pong
+    // configuration is one that already ships.
+    else if constexpr(kUseSoftmax && MaxK == 128)
         return HstuFwdPipelineKind::Tdm;
     else
         return HstuFwdPipelineKind::TrLoad;
