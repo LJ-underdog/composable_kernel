@@ -108,7 +108,7 @@ struct HstuAttentionWithSoftmaxFwdBlockTile<128, 128>
 {
     // kK1 follows the gemm1 warp-tile K (now 16x16x32), as every other gfx125 entry does.
     // kN0 == kN0Sub == kK1 so the TDM deep ping-pong (n0_loops == k1_loops == 1) applies.
-    using type        = ck_tile::sequence<128, 32, 32, 128, 32, 128>;
+    using type        = ck_tile::sequence<128, 64, 64, 128, 64, 128>;
     using gemm0_warps = ck_tile::sequence<4, 1, 1>;
     using gemm1_warps = ck_tile::sequence<4, 1, 1>;
 };
